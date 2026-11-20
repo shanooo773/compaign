@@ -1,9 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "git": {
+    "deploymentEnabled": true
+  },
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://ms-professor-outreach-api.aliraza57616.workers.dev/api/:path*"
+      "destination": "https://ms-professor-outreach-api.outreach-api.workers.dev/api/:path*"
     }
   ],
   "headers": [

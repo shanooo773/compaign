@@ -1,11 +1,12 @@
 {
   "name": "ms-professor-outreach-api",
+  "account_id": "74134f439c83a145640a8c91ae032cb7",
   "main": "src/index.ts",
   "workers_dev": true,
   "preview_urls": false,
   "compatibility_date": "2026-10-01",
   "vars": {
-    "APP_ORIGIN": "https://ms-professor-agent-malang43.vercel.app",
+    "APP_ORIGIN": "https://ms-professor-agent-one.vercel.app",
     "OAUTH_ENABLED": "true",
     "LIVE_EMAIL_ENABLED": "false",
     "MOCK_DELIVERY_ENABLED": "false",
@@ -19,12 +20,12 @@
     {
       "binding": "DB",
       "database_name": "outreach",
-      "database_id": "684cb48c-3f43-4cef-8217-cf9624d23522",
+      "database_id": "9f41b593-3113-4877-9359-f85eb4c0b51f",
       "migrations_dir": "migrations",
     },
   ],
   "kv_namespaces": [
-    { "binding": "DOCUMENTS_KV", "id": "522d30d6935741b0b659d92b3136ec8c" },
+    { "binding": "DOCUMENTS_KV", "id": "a379ca7383e44a17b39fa48a28f92fb0" },
   ],
   "triggers": { "crons": ["* * * * *"] },
   "observability": {
