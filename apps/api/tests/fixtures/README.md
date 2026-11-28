@@ -1,0 +1,1 @@
+Synthetic workbook fixtures exercise Excel 1900/1904 date systems. Both encode November 1, 2026 at 17:30 as an Excel date cell with timezone Asia/Karachi. They contain only the public synthetic template data.

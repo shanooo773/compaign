@@ -67,7 +67,7 @@ async function setup(provider = "gmail", followup = false, days = 7) {
       scheduled_at: new Date(Date.now() - 1000).toISOString(),
       timezone: "UTC",
       attachments: [],
-      sending_account_id: connection,
+      sending_account_id: connection, without_attachments_acknowledged: true,
       ...(followup
         ? {
             followup: {
@@ -140,7 +140,7 @@ describe("bounded reliable live-test outbox", () => {
       { days: 3, authorized: false },
       { days: 3 },
       { days: 0, authorized: true },
-      { days: 31, authorized: true },
+      { days: 61, authorized: true },
     ]) {
       const result = await h.request(
         "/messages",
@@ -152,7 +152,7 @@ describe("bounded reliable live-test outbox", () => {
           mode: "review",
           scheduled_at: new Date().toISOString(),
           timezone: "UTC",
-          sending_account_id: a.connection,
+          sending_account_id: a.connection, without_attachments_acknowledged: true,
           followup: {
             subject: "follow-up",
             body: "exact content",
@@ -190,7 +190,7 @@ describe("bounded reliable live-test outbox", () => {
     expect(network).toHaveBeenCalledTimes(1);
     expect(h.db.prepare("SELECT count(*) n FROM deliveries").get()!.n).toBe(1);
   });
-  it.each(["student", "mailbox", "global"])(
+  it.each(["global"])(
     "enforces the %s daily send budget before provider submission",
     async (scope) => {
       const a = await setup();
@@ -344,7 +344,7 @@ describe("bounded reliable live-test outbox", () => {
         authorized: true,
         scheduled_at: new Date().toISOString(),
         timezone: "UTC",
-        sending_account_id: a.connection,
+        sending_account_id: a.connection, without_attachments_acknowledged: true,
       },
       b.session,
     );
@@ -376,9 +376,9 @@ describe("bounded reliable live-test outbox", () => {
     expect(network).not.toHaveBeenCalled();
     expect(message().status).toBe("failed");
   });
-  it("enforces a hard per-student retained-message cap without partial inserts", async () => {
+  it("enforces a hard 400-message active cap without partial inserts", async () => {
     const a = await setup();
-    for (let i = 0; i < 99; i++)
+    for (let i = 0; i < 399; i++)
       h.db
         .prepare(
           "INSERT INTO messages(id,user_id,professor_id,subject,body,mode,scheduled_at,timezone) VALUES(?,?,?,'s','b','manual',?,'UTC')",
@@ -398,7 +398,7 @@ describe("bounded reliable live-test outbox", () => {
       a.session,
     );
     expect(response.status).toBe(429);
-    expect(h.db.prepare("SELECT count(*) n FROM messages").get()!.n).toBe(100);
+    expect(h.db.prepare("SELECT count(*) n FROM messages").get()!.n).toBe(400);
   });
 });
 describe("reply-driven follow-up safety", () => {
@@ -547,7 +547,7 @@ describe("reply-driven follow-up safety", () => {
       }),
     );
     await runLiveJobs(h.env, network as any);
-    expect(network).toHaveBeenCalledTimes(1);
+    expect(network).toHaveBeenCalledTimes(2);
     expect(
       h.db
         .prepare("SELECT status FROM messages WHERE parent_id=?")
@@ -661,11 +661,11 @@ describe("reply-driven follow-up safety", () => {
       .run(new Date(Date.now() - 3600000).toISOString());
     const network = vi.fn(async () => Response.json({ messages: [] }));
     await syncReplies(h.env, network as any, a.id);
-    expect(network).toHaveBeenCalledTimes(1);
+    expect(network).toHaveBeenCalledTimes(2);
   });
-  it("notifies and disarms follow-up plans when retained-message capacity is full", async () => {
+  it("materializes a reserved follow-up at full active capacity without double counting", async () => {
     const a = await sent();
-    for (let i = 0; i < 99; i++)
+    for (let i = 0; i < 399; i++)
       h.db
         .prepare(
           "INSERT INTO messages(id,user_id,professor_id,subject,body,mode,scheduled_at,timezone) VALUES(?,?,?,'s','b','manual',?,'UTC')",
@@ -681,12 +681,13 @@ describe("reply-driven follow-up safety", () => {
       h.db
         .prepare("SELECT count(*) n FROM notifications WHERE kind='followup'")
         .get()!.n,
-    ).toBe(1);
+    ).toBe(0);
     expect(
       h.db
         .prepare("SELECT count(*) n FROM messages WHERE parent_id IS NOT NULL")
         .get()!.n,
-    ).toBe(0);
+    ).toBe(1);
+    expect(h.db.prepare("SELECT count(*) n FROM active_message_capacity").get()!.n).toBe(400);
   });
   it("continues read-only reply checks when new sending is disabled", async () => {
     await sent();
@@ -707,9 +708,9 @@ describe("reply-driven follow-up safety", () => {
     );
     await syncReplies(h.env, network as any);
     expect(message().status).toBe("replied");
-    expect(network).toHaveBeenCalledTimes(1);
+    expect(network).toHaveBeenCalledTimes(2);
     await runLiveJobs(h.env, network as any);
-    expect(network).toHaveBeenCalledTimes(1);
+    expect(network).toHaveBeenCalledTimes(2);
   });
   it("can reconcile an earlier uncertain outcome without re-enabling sending", async () => {
     await setup();

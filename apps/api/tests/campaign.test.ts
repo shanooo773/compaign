@@ -298,6 +298,7 @@ describe("precise conditional sequences", () => {
     let sends = 0;
     let replied = false;
     const network = vi.fn(async (url: string) => {
+    if(url.includes("/messages?includeSpamTrash=")) return Response.json({messages:[]});
       if (url.includes("/messages/send")) {
         sends++;
         return Response.json({
@@ -353,6 +354,7 @@ describe("precise conditional sequences", () => {
     let sends = 0,
       reads = 0;
     const network = vi.fn(async (url: string) => {
+    if(url.includes("/messages?includeSpamTrash=")) return Response.json({messages:[]});
       if (url.includes("/messages/send")) {
         sends++;
         return Response.json({
@@ -520,6 +522,7 @@ describe("precise conditional sequences", () => {
     expect(() =>
       h.db.prepare("UPDATE followup_steps SET body='changed'").run(),
     ).toThrow(/immutable/);
+    advance(60001);
     await queueSequence(h.env, p.network as any);
     const child = h.db.prepare("SELECT child_id FROM followup_steps").get()!
       .child_id;
@@ -536,7 +539,7 @@ describe("precise conditional sequences", () => {
     ).toBe("cancelled");
   });
 
-  it("rejects accelerated external sequences even when production outreach is enabled", async () => {
+  it("accepts Excel-defined external sequences with production outreach enabled", async () => {
     h.db
       .prepare(
         "INSERT INTO outreach_settings(user_id,production_enabled) VALUES(?,1)",
@@ -546,9 +549,9 @@ describe("precise conditional sequences", () => {
     const [draft] = await importRows([
       sequenceRow([sequenceStep(5), sequenceStep(10)]),
     ]);
-    expect((await approve([draft.id], true)).status).toBe(403);
+    expect((await approve([draft.id], true)).status).toBe(200);
     expect(h.db.prepare("SELECT count(*) n FROM followup_steps").get()!.n).toBe(
-      0,
+      2,
     );
   });
 });
@@ -620,10 +623,11 @@ async function importRows(rows = [row]) {
   return h.db.prepare("SELECT * FROM messages ORDER BY rowid").all() as any[];
 }
 async function approve(ids: string[], followups = false) {
+  const review=await (await h.request("/campaigns/duplicate-check","POST",{ids},owner.session)).json();
   return h.request(
     "/messages/approve",
     "POST",
-    { ids, sending_account_id: connection, authorize_followups: followups },
+    { ids, sending_account_id: connection, without_attachments_acknowledged: true, authorize_followups: followups, duplicate_acknowledgement: review.acknowledgement },
     owner.session,
   );
 }
@@ -635,6 +639,7 @@ const send = () =>
 function provider(reply = false, failedRead = false) {
   let submitted = 0;
   const network = vi.fn(async (url: string) => {
+    if(url.includes("/messages?includeSpamTrash=")) return Response.json({messages:[]});
     if (url.includes("/messages/send")) {
       submitted++;
       return Response.json({
@@ -696,7 +701,7 @@ describe("one-time campaign lifecycle", () => {
         authorized: false,
         scheduled_at: new Date().toISOString(),
         timezone: "Asia/Karachi",
-        sending_account_id: connection,
+        sending_account_id: connection, without_attachments_acknowledged: true,
         followup: {
           days: 2,
           subject: "Composed follow-up",
@@ -785,6 +790,7 @@ describe("one-time campaign lifecycle", () => {
     h.db.prepare("UPDATE connections SET expires_at=0").run();
     let sends = 0;
     const network = vi.fn(async (url: string) => {
+    if(url.includes("/messages?includeSpamTrash=")) return Response.json({messages:[]});
       if (url.includes("oauth2.googleapis.com")) {
         expect(
           (
@@ -1420,4 +1426,626 @@ it("authorizes mixed campaigns with optional exact follow-ups and newly reimport
       )
     ).status,
   ).toBe(409);
+});
+
+describe("Excel-driven external campaigns", () => {
+  const numbered = (count: number) => {
+    const result: Record<string, string> = {
+      ...row,
+      follow_up_days: "",
+      follow_up_subject: "",
+      follow_up_body: "",
+    };
+    for (let n = 1; n <= count; n++)
+      for (const [key, value] of Object.entries(sequenceStep(1)))
+        result[`follow_up_${n}_${key}`] = String(value);
+    return result;
+  };
+  it.each([0, 1, 3, 5, 10])(
+    "imports, approves once and sends exactly %s follow-ups with quotas",
+    async (count) => {
+      h.env.LIVE_TEST_RECIPIENTS = "other@example.invalid";
+      h.db
+        .prepare(
+          "INSERT INTO outreach_settings(user_id,production_enabled) VALUES(?,1)",
+        )
+        .run(owner.id);
+      const [draft] = await importRows([numbered(count)]);
+      expect(
+        draft.followup_proposal
+          ? JSON.parse(draft.followup_proposal).steps.length
+          : 0,
+      ).toBe(count);
+      const dry = await h.request(
+        "/messages/approve",
+        "POST",
+        {
+          ids: [draft.id],
+          sending_account_id: connection, without_attachments_acknowledged: true,
+          authorize_followups: true,
+          dry_run: true,
+        },
+        owner.session,
+      );
+      expect(dry.status).toBe(200);
+      expect((await dry.json()).would_authorize_followups).toBe(count);
+      expect(
+        h.db.prepare("SELECT count(*) n FROM campaign_approvals").get()!.n,
+      ).toBe(0);
+      const approval = await approve([draft.id], true);
+      expect(approval.status).toBe(200);
+      expect((await approval.json()).authorized_followups).toBe(count);
+      const p = provider();
+      await runLiveJobs(h.env, p.network as any);
+      for (let n = 0; n < count; n++) {
+        advance(121000);
+        h.db
+          .prepare("UPDATE connections SET expires_at=?")
+          .run(Date.now() + 3600000);
+        await queueSequence(h.env, p.network as any);
+        await queueSequence(h.env, p.network as any);
+        await runLiveJobs(h.env, p.network as any);
+        await runLiveJobs(h.env, p.network as any);
+      }
+      if (count === 10) {
+        expect(p.submissions()).toBe(11);
+        advance(86400000);
+        h.db
+          .prepare("UPDATE connections SET expires_at=?")
+          .run(Date.now() + 3600000);
+        await runLiveJobs(h.env, p.network as any);
+      }
+      expect(p.submissions()).toBe(count + 1);
+      expect(
+        h.db.prepare("SELECT count(*) n FROM followup_steps").get()!.n,
+      ).toBe(count);
+      expect(
+        h.db.prepare("SELECT count(*) n FROM campaign_approvals").get()!.n,
+      ).toBe(1);
+      expect((await approve([draft.id], true)).status).toBe(409);
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
+  it.each([0, 5])(
+    "cancels ten steps after a reply following %s follow-ups",
+    async (sent) => {
+      const [draft] = await importRows([numbered(10)]);
+      await approve([draft.id], true);
+      const p = provider();
+      await runLiveJobs(h.env, p.network as any);
+      for (let n = 0; n < sent; n++) {
+        advance(121000);
+        await queueSequence(h.env, p.network as any);
+        await runLiveJobs(h.env, p.network as any);
+      }
+      advance(121000);
+      await queueSequence(h.env, provider(true).network as any);
+      await runLiveJobs(h.env, p.network as any);
+      expect(p.submissions()).toBe(sent + 1);
+      expect(
+        h.db
+          .prepare(
+            "SELECT count(*) n FROM followup_steps WHERE cancel_reason='reply'",
+          )
+          .get()!.n,
+      ).toBe(10);
+    },
+  );
+  it("atomically cancels the entire campaign midway without changing approvals", async () => {
+    const [draft] = await importRows([numbered(10)]);
+    const approval = await approve([draft.id], true),
+      campaign = (await approval.json()).campaign_id;
+    const p = provider();
+    await runLiveJobs(h.env, p.network as any);
+    advance(121000);
+    await queueSequence(h.env, p.network as any);
+    await runLiveJobs(h.env, p.network as any);
+    const before = h.db
+        .prepare("SELECT * FROM message_authorizations ORDER BY message_id")
+        .all(),
+      other = await h.user("other-cancel@example.invalid");
+    expect(
+      (
+        await h.request(
+          "/campaigns/" + campaign + "/cancel",
+          "POST",
+          {},
+          other.session,
+        )
+      ).status,
+    ).toBe(404);
+    for (let n = 0; n < 2; n++)
+      expect(
+        (
+          await h.request(
+            "/campaigns/" + campaign + "/cancel",
+            "POST",
+            {},
+            owner.session,
+          )
+        ).status,
+      ).toBe(200);
+    advance(86400000);
+    await queueSequence(h.env, p.network as any);
+    await runLiveJobs(h.env, p.network as any);
+    expect(p.submissions()).toBe(2);
+    expect(
+      h.db
+        .prepare(
+          "SELECT count(*) n FROM followup_steps WHERE cancel_reason='campaign_cancelled'",
+        )
+        .get()!.n,
+    ).toBe(10);
+    expect(
+      h.db
+        .prepare("SELECT * FROM message_authorizations ORDER BY message_id")
+        .all(),
+    ).toEqual(before);
+  });
+  it("rejects a stale campaign review after a timing edit", async () => {
+    const [draft] = await importRows([numbered(5)]),
+      reviewed = {
+        id: draft.id,
+        recipient,
+        subject: draft.subject,
+        body: draft.body,
+        scheduled_at: draft.scheduled_at,
+        timezone: draft.timezone,
+        followup_proposal: draft.followup_proposal,
+      };
+    h.db
+      .prepare(
+        "UPDATE messages SET scheduled_at='2099-01-01T00:00:00.000Z' WHERE id=?",
+      )
+      .run(draft.id);
+    const r = await h.request(
+      "/messages/approve",
+      "POST",
+      {
+        ids: [draft.id],
+        sending_account_id: connection, without_attachments_acknowledged: true,
+        authorize_followups: true,
+        reviewed_messages: [reviewed],
+      },
+      owner.session,
+    );
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toContain("Review the entire campaign");
+    expect(
+      h.db.prepare("SELECT count(*) n FROM campaign_approvals").get()!.n,
+    ).toBe(0);
+  });
+  it("checks ten distinct prior Gmail threads within the free Worker request budget", async () => {
+    const [draft] = await importRows([
+      sequenceRow(
+        Array.from({ length: 10 }, (_, n) => ({
+          ...sequenceStep(1),
+          subject: "Distinct " + n,
+        })),
+      ),
+    ]);
+    const { fileForm } = await import("./harness");
+    const docids: string[] = [];
+    for (let n = 0; n < 3; n++) {
+      const uploaded = await h.request(
+        "/documents",
+        "POST",
+        fileForm("Private file " + n, "file-" + n + ".txt", "text/plain"),
+        owner.session,
+      );
+      expect(uploaded.status).toBe(200);
+      docids.push((await uploaded.json()).id);
+    }
+    const approved = await h.request(
+      "/messages/approve",
+      "POST",
+      {
+        ids: [draft.id],
+        sending_account_id: connection, without_attachments_acknowledged: true,
+        authorize_followups: true,
+        attachment_selection: { initial: docids, followups: { "10": docids } },
+      },
+      owner.session,
+    );
+    expect(approved.status).toBe(200);
+    let sends = 0,
+      reads = 0;
+    const network = vi.fn(async (url: string) => {
+    if(url.includes("/messages?includeSpamTrash=")) return Response.json({messages:[]});
+      if (url.includes("/messages/send"))
+        return Response.json({
+          id: "accepted-" + ++sends,
+          threadId: "thread-" + sends,
+        });
+      if (url.includes("/threads/")) {
+        reads++;
+        return Response.json({ messages: [] });
+      }
+      throw Error("Unexpected request");
+    });
+    await runLiveJobs(h.env, network as any);
+    for (let n = 0; n < 9; n++) {
+      advance(121000);
+      await queueSequence(h.env, network as any);
+      await runLiveJobs(h.env, network as any);
+    }
+    advance(86400000);
+    h.db
+      .prepare("UPDATE connections SET expires_at=?")
+      .run(Date.now() + 3600000);
+    await queueSequence(h.env, network as any);
+    const prepare = h.env.DB.prepare.bind(h.env.DB);
+    let queries = 0;
+    h.env.DB.prepare = ((sql: string) => {
+      queries++;
+      return prepare(sql);
+    }) as any;
+    reads = 0;
+    await runLiveJobs(h.env, network as any);
+    expect(sends).toBe(11);
+    expect(reads).toBe(10);
+    expect(queries + reads + 1 + docids.length).toBeLessThanOrEqual(48);
+  });
+});
+
+describe("60-day campaign documents", () => {
+  const upload = async (content = "private synthetic CV", name = "cv.txt") => {
+    const { fileForm } = await import("./harness");
+    const r = await h.request(
+      "/documents",
+      "POST",
+      fileForm(content, name, "text/plain"),
+      owner.session,
+    );
+    expect(r.status).toBe(200);
+    return (await r.json()).id as string;
+  };
+  const selectedApproval = (
+    ids: string[],
+    initial: string[],
+    followups: Record<string, string[]> = {},
+    recipients: Record<string, any> = {},
+    dry_run = false,
+  ) =>
+    h.request(
+      "/messages/approve",
+      "POST",
+      {
+        ids,
+        sending_account_id: connection, without_attachments_acknowledged: true,
+        authorize_followups: true,
+        attachment_selection: { initial, followups, recipients },
+        dry_run,
+      },
+      owner.session,
+    );
+  it.each([30, 44, 45, 60])(
+    "accepts an exact %s-day complete sequence",
+    async (days) => {
+      const steps = Array.from({ length: days === 60 ? 10 : 5 }, (_, i) =>
+        sequenceStep(days / (days === 60 ? 10 : 5), "days", "previous"),
+      );
+      const actual = Number.isInteger(steps[0].delay_value)
+        ? steps
+        : [sequenceStep(days, "days", "original")];
+      const [draft] = await importRows([sequenceRow(actual)]);
+      const r = await approve([draft.id], true);
+      expect(r.status).toBe(200);
+      expect(
+        JSON.parse(
+          h.db.prepare("SELECT snapshot FROM message_authorizations").get()!
+            .snapshot as string,
+        ).followup.steps,
+      ).toEqual(actual);
+    },
+  );
+  it("preserves a legacy 45-day proposal and rejects schedules past 60 days", async () => {
+    const [draft] = await importRows([{ ...row, follow_up_days: "45" }]);
+    expect((await approve([draft.id], true)).status).toBe(200);
+    expect(h.db.prepare("SELECT days FROM automation").get()!.days).toBe(45);
+    const invalid = await h.request(
+      "/imports/drafts",
+      "POST",
+      [sequenceRow([sequenceStep(61, "days", "original")])],
+      owner.session,
+    );
+    expect(invalid.status).toBe(400);
+    expect((await invalid.json()).error).toContain("60 days");
+  });
+  it("attaches one uploaded CV to every initial email and no follow-ups by default", async () => {
+    const doc = await upload(),
+      drafts = await importRows([
+        sequenceRow([sequenceStep(1)]),
+        { ...sequenceRow([sequenceStep(1)]), email: "second@example.com" },
+      ]);
+    const r = await selectedApproval(
+      drafts.map((d) => d.id),
+      [doc],
+    );
+    expect(r.status).toBe(200);
+    expect(
+      h.db.prepare("SELECT count(*) n FROM campaign_attachment_pins").get()!.n,
+    ).toBe(2);
+    const mime: string[] = [];
+    const network = vi.fn(async (url: string, init: any) => {
+      if(url.includes("/messages?includeSpamTrash=")) return Response.json({messages:[]});
+      if (url.includes("/messages/send")) {
+        mime.push(
+          Buffer.from(JSON.parse(init.body).raw, "base64url").toString(),
+        );
+        return Response.json({
+          id: "accepted-" + mime.length,
+          threadId: "test-thread",
+        });
+      }
+      if (url.includes("/threads/")) return Response.json({ messages: [] });
+      throw Error("Unexpected network");
+    });
+    await runLiveJobs(h.env, network as any);
+    advance(121000);
+    await runLiveJobs(h.env, network as any);
+    expect(mime).toHaveLength(2);
+    for (const message of mime) {
+      expect(message).toContain("Content-Disposition: attachment;");
+      expect(message).toContain("filename*=UTF-8''cv.txt");
+      expect(message).toContain(
+        Buffer.from("private synthetic CV").toString("base64"),
+      );
+      expect(message).not.toContain("/api/documents/");
+    }
+    advance(121000);
+    await queueSequence(h.env, network as any);
+    await runLiveJobs(h.env, network as any);
+    expect(mime).toHaveLength(3);
+    expect(mime[2]).not.toContain("Content-Disposition: attachment;");
+  });
+
+  it("sends an explicitly selected follow-up file as MIME without inheriting the initial CV", async () => {
+    const a = await upload("Initial CV", "cv.txt"),
+      b = await upload("Follow-up evidence", "evidence.txt");
+    const [draft] = await importRows([sequenceRow([sequenceStep(1)])]);
+    expect((await selectedApproval([draft.id], [a], { "1": [b] })).status).toBe(
+      200,
+    );
+    const messages: string[] = [];
+    const network = vi.fn(async (url: string, init: any) => {
+      if(url.includes("/messages?includeSpamTrash=")) return Response.json({messages:[]});
+      if (url.includes("/messages/send")) {
+        messages.push(
+          Buffer.from(JSON.parse(init.body).raw, "base64url").toString(),
+        );
+        return Response.json({
+          id: "mime-" + messages.length,
+          threadId: "mime-thread",
+        });
+      }
+      if (url.includes("/threads/")) return Response.json({ messages: [] });
+      throw Error("Unexpected request");
+    });
+    await runLiveJobs(h.env, network as any);
+    advance(121000);
+    await queueSequence(h.env, network as any);
+    await runLiveJobs(h.env, network as any);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toContain("filename*=UTF-8''evidence.txt");
+    expect(messages[1]).toContain(
+      Buffer.from("Follow-up evidence").toString("base64"),
+    );
+    expect(messages[1]).not.toContain("filename*=UTF-8''cv.txt");
+  });
+  it("supports multiple files, explicit follow-up attachments and different professor initials", async () => {
+    const a = await upload("CV bytes", "cv.txt"),
+      b = await upload("Transcript bytes", "transcript.txt");
+    const drafts = await importRows([
+      sequenceRow([sequenceStep(1)]),
+      { ...sequenceRow([sequenceStep(1)]), email: "second@example.com" },
+    ]);
+    const r = await selectedApproval(
+      drafts.map((d) => d.id),
+      [a, b],
+      { "1": [b] },
+      { [drafts[1].id]: { initial: [b], followups: { "1": [b] } } },
+    );
+    expect(r.status).toBe(200);
+    const plans = h.db
+      .prepare(
+        "SELECT message_id,snapshot FROM message_authorizations ORDER BY message_id",
+      )
+      .all();
+    for (const plan of plans) {
+      const auth = JSON.parse(plan.snapshot as string);
+      expect(auth.attachment_plan.initial.map((d: any) => d.id)).toEqual(
+        plan.message_id === drafts[1].id ? [b] : [a, b],
+      );
+      expect(auth.attachment_plan.followups["1"].map((d: any) => d.id)).toEqual(
+        [b],
+      );
+    }
+    const p = provider();
+    await runLiveJobs(h.env, p.network as any);
+    advance(121000);
+    await runLiveJobs(h.env, p.network as any);
+    advance(121000);
+    await queueSequence(h.env, p.network as any);
+    const child = h.db
+      .prepare(
+        "SELECT snapshot FROM transports WHERE message_id IN (SELECT child_id FROM followup_steps) LIMIT 1",
+      )
+      .get()!;
+    expect(
+      JSON.parse(child.snapshot as string).attachments.map((d: any) => d.id),
+    ).toEqual([b]);
+  });
+  it("retains required documents beyond 30 days, resumes a 45-day follow-up, and cleans up after cancellation", async () => {
+    const doc = await upload(),
+      [draft] = await importRows([
+        sequenceRow([sequenceStep(45, "days", "original")]),
+      ]);
+    const put = vi.spyOn(h.env.DOCUMENTS_KV!, "put");
+    const r = await selectedApproval([draft.id], [doc], { "1": [doc] });
+    expect(r.status).toBe(200);
+    const campaign = (await r.json()).campaign_id;
+    expect(put).toHaveBeenCalled();
+    expect((put.mock.calls[0][2] as any).expirationTtl).toBeGreaterThanOrEqual(
+      67 * 86400,
+    );
+    const originalExpiry = h.db
+      .prepare("SELECT expires_at FROM documents")
+      .get()!.expires_at;
+    const p = provider();
+    await runLiveJobs(h.env, p.network as any);
+    advance(45 * 86400000 + 1000);
+    h.db.prepare("UPDATE sessions SET expires_at=?").run(Date.now() + 3600000);
+    h.db
+      .prepare("UPDATE connections SET expires_at=?")
+      .run(Date.now() + 3600000);
+    const { cleanDocuments } = await import("../src/storage");
+    await cleanDocuments(h.env);
+    expect(
+      h.db.prepare("SELECT storage_state,expires_at FROM documents").get(),
+    ).toMatchObject({ storage_state: "ready", expires_at: originalExpiry });
+    expect(
+      (
+        await h.request(
+          "/documents/" + doc + "/delete",
+          "POST",
+          {},
+          owner.session,
+        )
+      ).status,
+    ).toBe(409);
+    await queueSequence(h.env, p.network as any);
+    await runLiveJobs(h.env, p.network as any);
+    expect(p.submissions()).toBe(2);
+    await h.request(
+      "/campaigns/" + campaign + "/cancel",
+      "POST",
+      {},
+      owner.session,
+    );
+    await cleanDocuments(h.env);
+    expect(
+      h.db.prepare("SELECT count(*) n FROM campaign_attachment_pins").get()!.n,
+    ).toBe(0);
+    expect(
+      h.db.prepare("SELECT storage_state FROM documents").get()!.storage_state,
+    ).toBe("deleting");
+  });
+  it("keeps retained physical bytes reserved after cancellation and failed deletion", async () => {
+    const doc = await upload("a".repeat(1024));
+    const [draft] = await importRows([
+      sequenceRow([sequenceStep(45, "days", "original")]),
+    ]);
+    const approved = await selectedApproval([draft.id], [doc]);
+    expect(approved.status).toBe(200);
+    const campaign = (await approved.json()).campaign_id;
+    await h.request(
+      "/campaigns/" + campaign + "/cancel",
+      "POST",
+      {},
+      owner.session,
+    );
+    h.db.prepare("UPDATE documents SET expires_at=0 WHERE id=?").run(doc);
+    const { cleanDocuments } = await import("../src/storage");
+    await cleanDocuments(h.env);
+    advance(121000);
+    h.flags.failDelete = true;
+    await cleanDocuments(h.env);
+    const stored = h.db.prepare("SELECT * FROM documents WHERE id=?").get(doc)!;
+    expect(stored.retained_until).toBeNull();
+    expect(stored.storage_state).toBe("deleting");
+    expect(Number(stored.object_expires_at)).toBeGreaterThan(Date.now());
+    expect(h.bytes.has(String(stored.object_key))).toBe(true);
+    const other = await h.user("capacity@example.invalid");
+    h.db
+      .prepare(
+        "INSERT INTO documents(id,user_id,name,object_key,content_type,size,storage_backend,storage_state,expires_at) VALUES(?,?,'reserved.txt','synthetic-reservation','text/plain',?,'kv','ready',?)",
+      )
+      .run(
+        crypto.randomUUID(),
+        other.id,
+        100 * 1024 * 1024 - 1024,
+        Date.now() + 86400000,
+      );
+    const { fileForm } = await import("./harness");
+    const rejected = await h.request(
+      "/documents",
+      "POST",
+      fileForm("b".repeat(512)),
+      owner.session,
+    );
+    expect(rejected.status).toBe(429);
+    expect((await rejected.json()).error).toContain("storage quota");
+  });
+  it("rejects cross-user, expired, corrupt and unavailable files before authorizing", async () => {
+    const doc = await upload(),
+      [draft] = await importRows([sequenceRow([sequenceStep(1)])]);
+    const document = h.db
+      .prepare("SELECT * FROM documents WHERE id=?")
+      .get(doc)!;
+    const other = await h.user("other-document@example.invalid");
+    h.db
+      .prepare("UPDATE documents SET user_id=? WHERE id=?")
+      .run(other.id, doc);
+    expect((await selectedApproval([draft.id], [doc])).status).toBe(404);
+    h.db
+      .prepare("UPDATE documents SET user_id=?,expires_at=0 WHERE id=?")
+      .run(owner.id, doc);
+    expect((await selectedApproval([draft.id], [doc])).status).toBe(404);
+    h.db
+      .prepare("UPDATE documents SET expires_at=? WHERE id=?")
+      .run(Date.now() + 86400000, doc);
+    h.flags.visible = false;
+    expect((await selectedApproval([draft.id], [doc])).status).toBe(503);
+    h.flags.visible = true;
+    h.bytes.set(
+      String(document.object_key),
+      new TextEncoder().encode("changed bytes").buffer,
+    );
+    expect((await selectedApproval([draft.id], [doc])).status).toBe(503);
+    expect(
+      h.db.prepare("SELECT count(*) n FROM campaign_approvals").get()!.n,
+    ).toBe(0);
+    expect(
+      h.db.prepare("SELECT count(*) n FROM campaign_attachment_pins").get()!.n,
+    ).toBe(0);
+  });
+  it("never sends if an approved required file disappears", async () => {
+    const doc = await upload(),
+      [draft] = await importRows([sequenceRow([sequenceStep(1)])]);
+    expect((await selectedApproval([draft.id], [doc])).status).toBe(200);
+    h.bytes.clear();
+    const p = provider();
+    await runLiveJobs(h.env, p.network as any);
+    expect(p.submissions()).toBe(0);
+    expect(h.db.prepare("SELECT state FROM transports").get()!.state).toBe(
+      "waiting",
+    );
+  });
+  it("validates attachments in dry runs without retention writes or approvals", async () => {
+    const doc = await upload(),
+      [draft] = await importRows([row]),
+      writes = h.flags.writes;
+    const r = await selectedApproval([draft.id], [doc], {}, {}, true);
+    expect(r.status).toBe(200);
+    expect((await r.json()).attachment_plans[0].initial[0].id).toBe(doc);
+    expect(h.flags.writes).toBe(writes);
+    expect(
+      h.db.prepare("SELECT count(*) n FROM message_authorizations").get()!.n,
+    ).toBe(0);
+    expect(
+      h.db.prepare("SELECT count(*) n FROM campaign_attachment_pins").get()!.n,
+    ).toBe(0);
+  });
+  it("rejects attachment totals over 2 MiB and attachment edits after approval", async () => {
+    const a = await upload("a".repeat(1100000), "a.txt"),
+      b = await upload("b".repeat(1100000), "b.txt"),
+      [draft] = await importRows([row]);
+    expect((await selectedApproval([draft.id], [a, b])).status).toBe(400);
+    expect((await selectedApproval([draft.id], [a])).status).toBe(200);
+    expect((await selectedApproval([draft.id], [b])).status).toBe(409);
+    expect(() =>
+      h.db.prepare("UPDATE message_authorizations SET snapshot='{}'").run(),
+    ).toThrow(/immutable/);
+  });
 });

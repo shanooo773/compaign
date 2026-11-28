@@ -1,8 +1,9 @@
+import { campaignNameSQL } from "./campaign-management";
+import { followupAttachments } from "./campaign-attachments";
 import { type Env, HttpError, consume, notify, random, hash } from "./runtime";
 import { accessToken, oauthAvailable } from "./oauth";
-import { isLiveOwner, productionEnabled } from "./live-controls";
-import { testRecipients } from "./live-controls";
-import { delayMilliseconds } from "../../../shared/followup-sequence";
+import { hasOutreachAccess, productionEnabled } from "./live-controls";
+import { MAX_FOLLOWUPS } from "../../../shared/followup-sequence";
 import {
   emailProvider,
   ProviderError,
@@ -24,7 +25,8 @@ export async function allowedRecipient(
   address: string,
   user?: string,
 ) {
-  if (!liveEnabled(env) || (user && !isLiveOwner(env, user))) return false;
+  if (!liveEnabled(env) || (user && !(await hasOutreachAccess(env, user))))
+    return false;
   return (
     (env.LIVE_TEST_RECIPIENTS || "")
       .split(",")
@@ -130,6 +132,7 @@ async function receipt(env: Env, row: any, result: Receipt) {
       "INSERT INTO audit(id,user_id,action,entity_id) VALUES(?,?,'provider.sent_confirmed',?)",
     ).bind(crypto.randomUUID(), row.user_id, row.message_id),
   ]);
+
 }
 async function fail(env: Env, row: any, kind: string) {
   await env.DB.batch([
@@ -170,25 +173,19 @@ export async function runLiveJobs(env: Env, network: Fetcher = fetch) {
     .bind(now)
     .run();
   const rows = await env.DB.prepare(
-    `SELECT t.*,c.provider,c.address,c.subject AS account_subject,c.status AS account_status,c.scopes,c.tokens,c.expires_at,c.refresh_until,c.refresh_lease,m.status AS message_status,m.parent_id FROM transports t JOIN messages m ON m.id=t.message_id JOIN connections c ON c.id=t.connection_id JOIN profiles p ON p.user_id=t.user_id WHERE t.state IN ('waiting','uncertain') AND t.next_at<=? AND ((t.state='uncertain') OR (?=1 AND m.status='pending' AND m.live_ready=1 AND NOT EXISTS(SELECT 1 FROM professors pr WHERE pr.id=m.professor_id AND pr.deleted_at IS NOT NULL) AND m.approved=1 AND (m.mode!='auto' OR m.authorized=1) AND m.scheduled_at<=? AND p.paused=0 AND p.stopped=0)) ORDER BY t.next_at,t.message_id LIMIT 1`,
+    `SELECT t.*,r.snapshot revision_snapshot,COALESCE(r.version,0) revision_version,c.provider,c.address,c.subject AS account_subject,c.status AS account_status,c.scopes,c.tokens,c.expires_at,c.refresh_until,c.refresh_lease,m.status AS message_status,m.parent_id FROM transports t JOIN messages m ON m.id=t.message_id JOIN connections c ON c.id=t.connection_id JOIN profiles p ON p.user_id=t.user_id LEFT JOIN current_message_revisions r ON r.message_id=t.message_id WHERE t.state IN ('waiting','uncertain') AND t.next_at<=? AND ((t.state='uncertain') OR (?=1 AND m.status='pending' AND m.live_ready=1 AND NOT EXISTS(SELECT 1 FROM professors pr WHERE pr.id=m.professor_id AND pr.deleted_at IS NOT NULL) AND m.approved=1 AND (m.mode!='auto' OR m.authorized=1) AND COALESCE(r.scheduled_at,m.scheduled_at)<=? AND p.paused=0 AND p.stopped=0)) ORDER BY t.next_at,t.message_id LIMIT 1`,
   )
     .bind(now, +maySend, new Date().toISOString())
     .all<any>();
   for (const row of rows.results) {
-    const snapshot = JSON.parse(row.snapshot) as Snapshot;
+    const snapshot = JSON.parse(row.revision_snapshot || row.snapshot) as Snapshot;
     const sequence = await env.DB.prepare(
       "SELECT * FROM followup_steps WHERE child_id=?",
     )
       .bind(row.message_id)
       .first<any>();
     const replyParent = sequence?.root_id || row.parent_id;
-    if (
-      sequence &&
-      row.state !== "uncertain" &&
-      (sequence.cancel_reason ||
-        (!testRecipients(env).includes(snapshot.recipient.toLowerCase()) &&
-          (sequence.step > 1 || delayMilliseconds(sequence) < 3 * 86400000)))
-    )
+    if (sequence && row.state !== "uncertain" && sequence.cancel_reason)
       continue;
     if (
       row.state !== "uncertain" &&
@@ -275,12 +272,12 @@ export async function runLiveJobs(env: Env, network: Fetcher = fetch) {
     }
     const lease = random();
     const claimed = await env.DB.prepare(
-      `UPDATE transports SET state='leased',lease=?,lease_until=? WHERE message_id=? AND state='waiting' AND next_at<=? RETURNING message_id`,
+      `UPDATE transports SET state='leased',lease=?,lease_until=? WHERE message_id=? AND state='waiting' AND next_at<=? AND COALESCE((SELECT version FROM current_message_revisions r WHERE r.message_id=transports.message_id),0)=? AND EXISTS(SELECT 1 FROM messages m LEFT JOIN current_message_revisions r ON r.message_id=m.id WHERE m.id=transports.message_id AND m.status='pending' AND COALESCE(r.scheduled_at,m.scheduled_at)<=?) RETURNING message_id`,
     )
-      .bind(lease, now + 120000, row.message_id, now)
+      .bind(lease, now + 120000, row.message_id, now, row.revision_version, new Date(now).toISOString())
       .first();
     if (!claimed) continue;
-    let submitted = false;
+    let submitted = false, attemptRecorded = false;
     try {
       await consume(
         env,
@@ -289,7 +286,6 @@ export async function runLiveJobs(env: Env, network: Fetcher = fetch) {
         1,
         new Date().toISOString().slice(0, 16),
       );
-      await consume(env, `send:${row.user_id}:day`, 10);
       await consume(env, "send:global:day", 100);
       // Same provider identity shares a budget even across application users.
       const mailbox = await hash(row.provider + ":" + row.account_subject);
@@ -300,7 +296,6 @@ export async function runLiveJobs(env: Env, network: Fetcher = fetch) {
         1,
         new Date().toISOString().slice(0, 16),
       );
-      await consume(env, `send:mailbox:${mailbox}:day`, 10);
       const token = await accessToken(env, connection, network),
         attachments = [];
       for (const attachment of snapshot.attachments) {
@@ -316,26 +311,32 @@ export async function runLiveJobs(env: Env, network: Fetcher = fetch) {
           bytes: await documentBytes(env, doc),
         });
       }
+      if (sequence && row.revision_snapshot) {
+        const parent=await env.DB.prepare("SELECT COALESCE(r.snapshot,t.snapshot) snapshot,t.thread_id FROM transports t LEFT JOIN current_message_revisions r ON r.message_id=t.message_id WHERE t.message_id=?").bind(sequence.root_id).first<any>();
+        if(parent){const original=JSON.parse(parent.snapshot);snapshot.threadId=snapshot.subject===original.subject?parent.thread_id:undefined;snapshot.inReplyTo=original.key;}
+      }
       if (sequence) {
         const prior = await env.DB.prepare(
           "SELECT t.message_id,t.thread_id FROM transports t JOIN messages m ON m.id=t.message_id WHERE t.state='confirmed' AND t.thread_id IS NOT NULL AND (m.id=? OR m.id IN (SELECT child_id FROM followup_steps WHERE root_id=?)) ORDER BY m.sent_at,t.message_id",
         )
           .bind(sequence.root_id, sequence.root_id)
           .all<any>();
-        const threads = new Set<string>();
+        const threads = new Set<string>(),
+          messageIds: string[] = [];
         for (const previous of prior.results) {
-          if (threads.has(previous.thread_id)) continue;
-          threads.add(previous.thread_id);
-          if (
-            !(await syncReplies(env, network, row.user_id, previous.message_id))
-          )
-            throw new HttpError(
-              503,
-              "A complete reply check of every earlier Gmail thread is required before sending.",
-            );
+          if (!threads.has(previous.thread_id)) {
+            threads.add(previous.thread_id);
+            messageIds.push(previous.message_id);
+          }
         }
-        if (!threads.size)
-          throw new HttpError(503, "Previous Gmail thread is unavailable.");
+        if (
+          !threads.size ||
+          !(await syncReplies(env, network, row.user_id, messageIds))
+        )
+          throw new HttpError(
+            503,
+            "A complete reply check of every earlier Gmail thread is required before sending.",
+          );
       } else if (row.parent_id) {
         const checkedAfter = Date.now();
         await env.DB.prepare(
@@ -381,11 +382,20 @@ export async function runLiveJobs(env: Env, network: Fetcher = fetch) {
           .run();
         continue;
       }
+      try {
       await env.DB.prepare(
         "INSERT INTO delivery_attempts(id,message_id,attempt,started_at,outcome) SELECT ?,message_id,attempts,?,'submitting' FROM transports WHERE message_id=?",
       )
         .bind(crypto.randomUUID(), Date.now(), row.message_id)
         .run();
+        attemptRecorded = true;
+      } catch (error) {
+        if(error instanceof Error && /Rolling sending allowance exhausted/.test(error.message)) {
+          await env.DB.prepare("UPDATE transports SET attempts=MAX(0,attempts-1) WHERE message_id=? AND lease=?").bind(row.message_id,lease).run();
+          throw new HttpError(429,"Rolling sending allowance exhausted; approved message postponed.");
+        }
+        throw error;
+      }
       submitted = true;
       const result = await provider.send(token, {
         ...snapshot,
@@ -408,7 +418,7 @@ export async function runLiveJobs(env: Env, network: Fetcher = fetch) {
         );
       }
     } catch (error) {
-      await env.DB.prepare(
+      if(attemptRecorded) await env.DB.prepare(
         "UPDATE delivery_attempts SET outcome=? WHERE message_id=? AND attempt=(SELECT attempts FROM transports WHERE message_id=?)",
       )
         .bind(
@@ -480,46 +490,89 @@ export async function syncReplies(
   env: Env,
   network: Fetcher = fetch,
   user?: string,
-  messageId?: string,
+  messageId?: string | string[],
+  backgroundNextSync?: number,
 ) {
   if (env.OAUTH_ENABLED !== "true" || !env.TOKEN_ENCRYPTION_KEY) return false;
-  let complete = false;
+  let complete = true;
+  const ids = messageId
+    ? Array.isArray(messageId)
+      ? messageId
+      : [messageId]
+    : null;
+  const grouped = Array.isArray(messageId);
+  if (ids && (!ids.length || ids.length > MAX_FOLLOWUPS + 1)) return false;
+  const encodedIds = ids ? JSON.stringify(ids) : null;
   const now = Date.now();
+  const nextSync = backgroundNextSync ?? now + 3600000;
   const rows = await env.DB.prepare(
-    `SELECT t.*,m.sent_at,c.provider,c.status AS account_status,c.scopes,c.tokens,c.expires_at,c.refresh_until,c.refresh_lease FROM transports t JOIN messages m ON m.id=t.message_id JOIN connections c ON c.id=t.connection_id WHERE t.state='confirmed' AND t.thread_id IS NOT NULL AND (t.next_sync<=? OR t.message_id=?) AND c.status='connected' AND m.sent_at>? AND (? IS NULL OR t.user_id=?) AND (? IS NULL OR t.message_id=?) ORDER BY t.next_sync LIMIT ?`,
+    `SELECT t.*,m.sent_at,c.provider,c.status AS account_status,c.scopes,c.tokens,c.expires_at,c.refresh_until,c.refresh_lease FROM transports t JOIN messages m ON m.id=t.message_id JOIN connections c ON c.id=t.connection_id WHERE t.state='confirmed' AND t.thread_id IS NOT NULL AND ${ids ? 't.message_id IN (SELECT value FROM json_each(?))' : 't.next_sync<=?'} AND c.status='connected' AND NOT EXISTS(SELECT 1 FROM message_authorizations auth JOIN campaign_workspace_deletions d ON d.campaign_id=auth.campaign_id AND d.user_id=auth.user_id WHERE auth.message_id=m.id AND d.state='deleted') AND m.sent_at>? AND (? IS NULL OR t.user_id=?) AND (? IS NULL OR t.message_id IN (SELECT value FROM json_each(?))) ORDER BY t.next_sync LIMIT ?`,
   )
     .bind(
-      now,
-      messageId || null,
-      messageId
+      ids ? encodedIds : now,
+      ids
         ? "1970-01-01T00:00:00.000Z"
-        : new Date(now - 31 * 86400000).toISOString(),
+        : new Date(now - 67 * 86400000).toISOString(),
       user || null,
       user || null,
-      messageId || null,
-      messageId || null,
-      messageId ? 1 : user ? 2 : 1,
+      encodedIds,
+      encodedIds,
+      ids ? ids.length : user ? 2 : 5,
     )
     .all<any>();
-  for (const row of rows.results) {
-    if (!oauthAvailable(env, row.provider)) continue;
-    await env.DB.prepare("UPDATE transports SET next_sync=? WHERE message_id=?")
-      .bind(now + 300000, row.message_id)
-      .run();
-    if (!/gmail.readonly|Mail.Read/.test(row.scopes)) continue;
+  if (!rows.results.length || (ids && rows.results.length !== ids.length))
+    return false;
+  // One bounded quota reservation for all prior threads avoids per-thread D1 overhead.
+  if (grouped) {
     try {
-      await consume(env, "mailbox:global:polls", 1000);
+      await consume(env, "mailbox:global:polls", 20000, rows.results.length);
+    } catch {
+      await env.DB.prepare(
+        "UPDATE transports SET sync_checked_at=0,sync_error='Mailbox polling limit reached; sending postponed' WHERE message_id IN (SELECT value FROM json_each(?))",
+      )
+        .bind(encodedIds)
+        .run();
+      return false;
+    }
+  }
+  const groupedUpdates: {
+    id: string;
+    cursor: string | null;
+    checked: number;
+    partial: number;
+  }[] = [];
+  const replyProviders=new Map<string,ReturnType<typeof emailProvider>>();
+  const searchSince=rows.results.map(r=>r.sent_at).sort()[0];
+  for (const row of rows.results) {
+    if (!oauthAvailable(env, row.provider)) {
+      complete = false;
+      continue;
+    }
+    if (!grouped)
+      await env.DB.prepare(
+        "UPDATE transports SET next_sync=? WHERE message_id=?",
+      )
+        .bind(nextSync, row.message_id)
+        .run();
+    if (!/gmail.readonly|Mail.Read/.test(row.scopes)) {
+      complete = false;
+      continue;
+    }
+    try {
+      if (!grouped) await consume(env, "mailbox:global:polls", 20000);
       const token = await accessToken(
         env,
         { ...row, id: row.connection_id, status: row.account_status },
         network,
       );
-      const result = await emailProvider(row.provider, network).replies(
+      const snapshot = JSON.parse(row.snapshot) as Snapshot;
+      if(!replyProviders.has(row.connection_id)) replyProviders.set(row.connection_id,emailProvider(row.provider,network));
+      const result = await replyProviders.get(row.connection_id)!.replies(
         token,
         row.thread_id,
         row.sync_cursor,
+        {recipient:snapshot.recipient,key:snapshot.key,sentAt:searchSince},
       );
-      const snapshot = JSON.parse(row.snapshot) as Snapshot;
       const known = new Set(
         (result.events.length
           ? (
@@ -535,7 +588,6 @@ export async function syncReplies(
       let processed = 0,
         partial = false;
       for (const event of result.events) {
-        if (known.has(event.id)) continue;
         const sender = (event.sender.match(/<([^>]+)>/)?.[1] || event.sender)
           .trim()
           .toLowerCase();
@@ -545,8 +597,10 @@ export async function syncReplies(
           Date.parse(event.receivedAt) <= Date.parse(row.sent_at)
         )
           continue;
-        if (!event.bounce && sender !== snapshot.recipient.toLowerCase())
+        if (!event.bounce && (event.labels?.includes("SENT") || sender !== snapshot.recipient.trim().toLowerCase()))
           continue;
+        const replyDescription = !event.bounce && event.labels ? await recordReplyLocation(env,row,event) : "A reply was received. Follow-up automation has stopped.";
+        if (known.has(event.id)) continue;
         if (processed >= 1) {
           partial = true;
           break;
@@ -570,8 +624,8 @@ export async function syncReplies(
             event.receivedAt,
           ),
           env.DB.prepare(
-            "UPDATE messages SET status=CASE WHEN ?='bounce' THEN 'failed' ELSE 'replied' END,followup_at=NULL WHERE id=? AND status='sent'",
-          ).bind(kind, row.message_id),
+            "UPDATE messages SET status=CASE WHEN ?='bounce' THEN 'failed' ELSE 'replied' END,followup_at=NULL WHERE user_id=? AND status='sent' AND (id=? OR (?!='bounce' AND (id IN (SELECT root_id FROM followup_steps WHERE child_id=?) OR id=(SELECT parent_id FROM messages WHERE id=?))))",
+          ).bind(kind,row.user_id,row.message_id,kind,row.message_id,row.message_id),
           env.DB.prepare(
             "UPDATE automation SET generated=1 WHERE message_id=?",
           ).bind(row.message_id),
@@ -592,24 +646,35 @@ export async function syncReplies(
             row.user_id,
             kind,
             kind === "reply"
-              ? "A reply was received. Follow-up automation has stopped."
+              ? replyDescription
               : "A decline, opt-out or bounce was detected. Further sending to this recipient is blocked.",
             row.message_id,
           ),
         ]);
       }
-      await env.DB.prepare(
-        "UPDATE transports SET sync_cursor=?,sync_checked_at=?,sync_error=CASE WHEN ?=1 THEN 'Incomplete mailbox check; sending postponed' ELSE NULL END WHERE message_id=?",
-      )
-        .bind(
-          partial ? row.sync_cursor : result.cursor,
-          partial || result.cursor ? 0 : Date.now(),
-          +(partial || !!result.cursor),
-          row.message_id,
+      if (grouped)
+        groupedUpdates.push({
+          id: row.message_id,
+          cursor: partial ? row.sync_cursor : result.cursor,
+          checked: partial || result.cursor ? 0 : Date.now(),
+          partial: +(partial || !!result.cursor),
+        });
+      else
+        await env.DB.prepare(
+          "UPDATE transports SET sync_cursor=?,sync_checked_at=?,sync_error=CASE WHEN ?=1 THEN 'Incomplete mailbox check; sending postponed' ELSE NULL END,next_sync=? WHERE message_id=?",
         )
-        .run();
-      complete = !partial && !result.cursor && processed === 0;
+          .bind(
+            partial ? row.sync_cursor : result.cursor,
+            partial || result.cursor ? 0 : Date.now(),
+            +(partial || !!result.cursor),
+            nextSync,
+            row.message_id,
+          )
+          .run();
+      complete = complete && !partial && !result.cursor && processed === 0;
+      if (grouped && !complete && backgroundNextSync === undefined) break;
     } catch (error) {
+      complete = false;
       await env.DB.prepare(
         "UPDATE transports SET sync_checked_at=0,sync_error='Reply check failed; sending postponed until a complete check succeeds' WHERE message_id=?",
       )
@@ -631,17 +696,34 @@ export async function syncReplies(
       }
     }
   }
+  if (groupedUpdates.length)
+    await env.DB.prepare(
+      "UPDATE transports SET sync_cursor=(SELECT json_extract(value,'$.cursor') FROM json_each(?) WHERE json_extract(value,'$.id')=transports.message_id),sync_checked_at=(SELECT json_extract(value,'$.checked') FROM json_each(?) WHERE json_extract(value,'$.id')=transports.message_id),sync_error=CASE WHEN (SELECT json_extract(value,'$.partial') FROM json_each(?) WHERE json_extract(value,'$.id')=transports.message_id)=1 THEN 'Incomplete mailbox check; sending postponed' ELSE NULL END,next_sync=? WHERE message_id IN (SELECT json_extract(value,'$.id') FROM json_each(?))",
+    )
+      .bind(
+        JSON.stringify(groupedUpdates),
+        JSON.stringify(groupedUpdates),
+        JSON.stringify(groupedUpdates),
+        nextSync,
+        JSON.stringify(groupedUpdates),
+      )
+      .run();
   return complete;
 }
 export async function queueFollowups(env: Env, network: Fetcher = fetch) {
   if (!liveEnabled(env)) return;
   const rows = await env.DB.prepare(
-    `SELECT a.*,m.user_id,m.professor_id,m.timezone,m.sent_at,t.connection_id,t.thread_id,t.snapshot,t.sync_checked_at,t.sync_cursor,c.status AS account_status,c.scopes FROM automation a JOIN messages m ON m.id=a.message_id JOIN transports t ON t.message_id=m.id JOIN connections c ON c.id=t.connection_id JOIN profiles p ON p.user_id=m.user_id WHERE a.generated=0 AND NOT EXISTS(SELECT 1 FROM professors pr WHERE pr.id=m.professor_id AND pr.deleted_at IS NOT NULL) AND m.live_ready=1 AND m.parent_id IS NULL AND m.status='sent' AND p.paused=0 AND p.stopped=0 AND c.status='connected' AND COALESCE(a.due_at,CAST((julianday(m.sent_at)-2440587.5)*86400000 AS INTEGER)+a.days*86400000)<=? ORDER BY COALESCE(a.due_at,0),a.message_id LIMIT 1`,
+    `SELECT a.*,(SELECT snapshot FROM message_authorizations auth WHERE auth.message_id=m.id) authorization,m.user_id,m.professor_id,m.timezone,m.sent_at,t.connection_id,t.thread_id,t.snapshot,t.sync_checked_at,t.sync_cursor,c.status AS account_status,c.scopes FROM automation a JOIN messages m ON m.id=a.message_id JOIN transports t ON t.message_id=m.id JOIN connections c ON c.id=t.connection_id JOIN profiles p ON p.user_id=m.user_id WHERE a.generated=0 AND NOT EXISTS(SELECT 1 FROM professors pr WHERE pr.id=m.professor_id AND pr.deleted_at IS NOT NULL) AND m.live_ready=1 AND m.parent_id IS NULL AND m.status='sent' AND p.paused=0 AND p.stopped=0 AND c.status='connected' AND COALESCE(a.due_at,CAST((julianday(m.sent_at)-2440587.5)*86400000 AS INTEGER)+a.days*86400000)<=? ORDER BY COALESCE(a.due_at,0),a.message_id LIMIT 1`,
   )
     .bind(Date.now())
     .all<any>();
   for (const row of rows.results) {
     const snapshot = JSON.parse(row.snapshot) as Snapshot;
+    snapshot.attachments = followupAttachments(
+      JSON.parse(row.authorization || "null"),
+      snapshot.attachments,
+      1,
+    );
     if (row.sync_checked_at <= Date.now() - 60000 || row.sync_cursor) {
       const checkedAfter = Date.now();
       await env.DB.prepare(
@@ -760,10 +842,29 @@ export async function queueFollowups(env: Env, network: Fetcher = fetch) {
           env,
           row.user_id,
           "followup",
-          "Automatic follow-up could not be queued because retained-message capacity was reached. The plan has stopped; review private retention with the operator.",
+          "Automatic follow-up could not be queued because active workspace capacity was reached. The plan has stopped; review active drafts and follow-ups.",
           row.message_id,
         );
       } else throw error;
     }
   }
+}
+
+export function replyLocation(labels:string[]) {
+ if(labels.includes("TRASH")) return "Trash";
+ if(labels.includes("SPAM")) return "Spam";
+ if(labels.includes("INBOX")) return "Inbox";
+ return labels.some(label=>label.startsWith("Label_")) ? "Custom label / Archived" : "Archived / All Mail";
+}
+async function recordReplyLocation(env:Env,row:any,event:import("./providers").MailEvent){
+ const location=replyLocation(event.labels || []);
+ const detail=await env.DB.prepare(`SELECT p.name,${campaignNameSQL} campaign_name FROM messages m JOIN professors p ON p.id=m.professor_id LEFT JOIN message_authorizations a ON a.message_id=m.id LEFT JOIN campaign_approvals c ON c.id=a.campaign_id AND c.user_id=m.user_id WHERE m.id=? AND m.user_id=?`).bind(row.message_id,row.user_id).first<any>();
+ const professor=detail?.name || "Professor", campaign=detail?.campaign_name || "Outreach campaign";
+ const warning=location==="Spam" || location==="Trash";
+ const id="event:"+row.connection_id+":"+event.id;
+ await env.DB.batch([
+ env.DB.prepare("INSERT INTO reply_locations(connection_id,provider_id,user_id,message_id,location,labels,checked_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(connection_id,provider_id) DO UPDATE SET location=excluded.location,labels=excluded.labels,checked_at=excluded.checked_at WHERE reply_locations.user_id=excluded.user_id AND (reply_locations.location IS NOT excluded.location OR reply_locations.labels IS NOT excluded.labels)").bind(row.connection_id,event.id,row.user_id,row.message_id,location,JSON.stringify(event.labels),Date.now()),
+ ...(warning ? [env.DB.prepare("INSERT INTO notifications(id,user_id,kind,message,entity_id) VALUES(?,?,'reply_warning',?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,message=excluded.message WHERE notifications.user_id=excluded.user_id AND (notifications.kind IS NOT excluded.kind OR notifications.message IS NOT excluded.message)").bind("location:"+id,row.user_id,`Reply received in ${location} from ${professor} ? ${campaign}. Check your connected Gmail ${location} folder.`,row.message_id)] : [env.DB.prepare("UPDATE notifications SET kind='reply_location',message=? WHERE id=? AND user_id=?").bind(`Reply from ${professor} ? ${campaign}. Location: ${location}.`,"location:"+id,row.user_id)]),
+ ]);
+ return `${professor} replied to your email ? ${campaign}.`;
 }

@@ -1,3 +1,5 @@
+> Historical release record. Current limits, templates, timezone handling and safety behavior are documented in [Excel-driven follow-up upgrade](EXCEL-FOLLOWUP-UPGRADE.md).
+
 # Excel-to-Gmail verification - 2026-10-22
 
 Live delivery remains disabled (`LIVE_EMAIL_ENABLED=false`). No real professors or live provider sends are used in these checks. Existing production Gmail credentials/connections, account data, documents and Groq configuration are preserved.

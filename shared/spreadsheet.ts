@@ -1,4 +1,34 @@
-import { validateSequence, type FollowupStep } from "./followup-sequence";
+import { spreadsheetSchedule } from "./spreadsheet-schedule";
+import {
+  MAX_FOLLOWUPS,
+  MAX_SEQUENCE_DAYS,
+  validateSequence,
+  type FollowupStep,
+} from "./followup-sequence";
+// Authoritative import metadata, shared by parsing, previews and generated templates.
+export const spreadsheetBaseColumns = [
+  "name",
+  "email",
+  "university",
+  "interests",
+  "subject",
+  "body",
+  "scheduled_at",
+  "timezone",
+];
+export const spreadsheetStepFields = [
+  "subject",
+  "body",
+  "delay_value",
+  "delay_unit",
+  "relative_to",
+];
+export const spreadsheetColumns = [
+  ...spreadsheetBaseColumns,
+  ...Array.from({ length: MAX_FOLLOWUPS }, (_, i) =>
+    spreadsheetStepFields.map((field) => `follow_up_${i + 1}_${field}`),
+  ).flat(),
+];
 export type FollowupProposal = {
   days: number;
   subject: string;
@@ -27,6 +57,13 @@ export function normalizeSpreadsheetRow(
   return Object.fromEntries(
     Object.entries(row).map(([key, value]) => {
       if (value == null) return [key, ""];
+      if (key === "scheduled_at") {
+        try {
+          return [key, spreadsheetSchedule(value, row.timezone)];
+        } catch (error) {
+          throw new Error(`Row ${index + 2}: ${(error as Error).message}`);
+        }
+      }
       if (typeof value === "string") return [key, value];
       if (typeof value === "number" && Number.isFinite(value))
         return [key, String(value)];
@@ -66,7 +103,7 @@ export function spreadsheetDraft(
       "provide subject (up to 500 characters) and body (up to 20000 characters).",
     );
   const date = cells.scheduled_at || "";
-  // Excel date cells have no timezone: require UTC text to avoid browser-dependent shifts.
+  // Date cells were converted using the explicit row timezone; ISO text stays UTC.
   if (
     !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(date) ||
     !Number.isFinite(Date.parse(date))
@@ -96,13 +133,13 @@ export function spreadsheetDraft(
       body = cells.followup_body || "";
     if (
       (cells.followup_days &&
-        (!Number.isInteger(days) || days < 1 || days > 30)) ||
+        (!Number.isInteger(days) || days < 1 || days > MAX_SEQUENCE_DAYS)) ||
       subject.length > 500 ||
       /[\r\n]/.test(subject) ||
       body.length > 20000
     )
       fail(
-        "follow-up requires an integer delay of 1-30 days, a single-line subject and a body up to 20000 characters.",
+        "follow-up requires an integer delay of 1-60 days, a single-line subject and a body up to 20000 characters.",
       );
     if (!cells.followup_days || !subject || !body) {
       followup_issue =
@@ -123,13 +160,19 @@ export function spreadsheetDraft(
       };
     } else followup_proposal = { days, subject, body };
   }
-  const numbered = Array.from({ length: 5 }, (_, index) => {
+  for (const [key, value] of Object.entries(cells)) {
+    const match =
+      /^follow_up_(\d+)_(subject|body|delay_value|delay_unit|relative_to)$/.exec(
+        key,
+      );
+    if (value && match && (+match[1] < 1 || +match[1] > MAX_FOLLOWUPS))
+      fail(
+        `unsupported follow-up column ${key}; supported steps are 1-${MAX_FOLLOWUPS}.`,
+      );
+  }
+  const numbered = Array.from({ length: MAX_FOLLOWUPS }, (_, index) => {
     const prefix = `follow_up_${index + 1}_`;
-    if (
-      !["subject", "body", "delay_value", "delay_unit", "relative_to"].some(
-        (field) => cells[prefix + field],
-      )
-    )
+    if (!spreadsheetStepFields.some((field) => cells[prefix + field]))
       return null;
     return {
       subject: cells[prefix + "subject"],

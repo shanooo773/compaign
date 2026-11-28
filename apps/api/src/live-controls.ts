@@ -9,6 +9,18 @@ export function isLiveOwner(env: Env, user: string) {
       .includes(user)
   );
 }
+// A successful Google activation grants only that verified student outreach access.
+// Administrator-only mode controls still use isLiveOwner and are not delegated.
+export async function googleStudentGrant(env: Env, user: string) {
+  return !!(await env.DB.prepare(
+    "SELECT 1 ok FROM google_student_identities g JOIN users u ON u.id=g.user_id WHERE g.user_id=? AND g.outreach_enabled=1 AND u.email_verified_at IS NOT NULL AND lower(u.email)=g.email",
+  )
+    .bind(user)
+    .first());
+}
+export async function hasOutreachAccess(env: Env, user: string) {
+  return isLiveOwner(env, user) || (await googleStudentGrant(env, user));
+}
 export function testRecipients(env: Env) {
   return (env.LIVE_TEST_RECIPIENTS || "")
     .split(",")
@@ -16,6 +28,7 @@ export function testRecipients(env: Env) {
     .filter(Boolean);
 }
 export async function productionEnabled(env: Env, user: string) {
+  if (await googleStudentGrant(env, user)) return true;
   return (
     isLiveOwner(env, user) &&
     !!(
@@ -102,7 +115,7 @@ export async function checkGmail(
     .bind(user || null, user || null, Date.now() - 3600000, user ? 1 : 0)
     .all<any>();
   for (const row of rows.results) {
-    if (!isLiveOwner(env, row.user_id)) continue;
+    if (!(await hasOutreachAccess(env, row.user_id))) continue;
     let status = "failed",
       detail = "Mailbox check failed; review connection or reconnect.";
     try {

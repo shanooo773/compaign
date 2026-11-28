@@ -484,7 +484,7 @@ describe("security isolation and lifecycle", () => {
       expect(h.db.prepare(`SELECT count(*) n FROM ${table}`).get()!.n).toBe(0);
     expect(h.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
   });
-  it("keeps Mailjet disabled, creates an unverified pending account and exposes no Turnstile secret", async () => {
+  it("works with transactional delivery disabled, creates an unverified pending account and exposes no Turnstile secret", async () => {
     h.env.MAIL_PROVIDER = "disabled";
     const network = vi.fn(() => {
       throw new Error("No external calls permitted");

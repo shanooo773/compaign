@@ -1,5 +1,7 @@
 # No-card deployment and integration runbook
 
+Current release: [Complete 60-day campaign, private attachment and UI upgrade](docs/COMPLETE-UPGRADE.md).
+
 Prepared 2026-10-21 for private repository `Malang43/MS-Professor-Agent`. The mock-default application was deployed with explicit authorization on 2026-10-21. See [the production deployment report](docs/DEPLOYMENT-STATUS.md) for live URLs, resource IDs, verification results, and remaining tasks. Default production uses **Vercel Hobby + Workers Free + D1 Free + Workers KV Free**. No card, trial, paid upgrade, R2 subscription, purchased domain or real professor outreach is authorized. If an account/setup step requires payment details or an ineligible plan, stop that step and report it. No unlimited free usage is promised.
 
 ## One-time campaign approval and automatic follow-ups
@@ -14,13 +16,9 @@ The current owner has authorized restricted live activation for `raza1206896@gma
 
 The current repeat-campaign correction is documented in [REPEAT-CAMPAIGN-RELEASE.md](docs/REPEAT-CAMPAIGN-RELEASE.md): new uploads create independent campaigns even for previously contacted recipients, retries are scoped to the upload, deletion alone never permanently blocks an address, and genuine opt-outs remain enforced. One complete approval still authorizes every displayed initial email and conditional follow-up.
 
-See [SIMPLIFIED-CAMPAIGN-RELEASE.md](docs/SIMPLIFIED-CAMPAIGN-RELEASE.md) for the current Excel wizard, safe deleted-address reimport, one-time atomic approval and deployment verification. Transactional authentication email is disabled; no Mailjet setup is required. Password login, registered passkeys and saved recovery codes remain available. Unverified users retain private workspace access while sensitive mailbox actions remain verification-gated under the existing policy.
-
 ## Historical transactional account email
 
 The provider integrations below are retained for compatibility and are inactive in production.
-
-See [MAILJET-ACCOUNT-EMAIL.md](docs/MAILJET-ACCOUNT-EMAIL.md) for the Mailjet Free integration, controlled delivery certification and current activation result. The earlier [Brevo runbook](docs/TRANSACTIONAL-EMAIL-RELEASE.md) remains historical; Mailjet uses the existing secure verification/recovery flows and installed Cloudflare secrets. Gmail outreach configuration remains separate and unchanged.
 
 ## Excel-to-Gmail automation verification
 
@@ -173,7 +171,7 @@ Use `curl.exe` in Windows PowerShell. Expect mock mode, KV storage, live_email f
 
 Mock scheduling still runs each minute, up to 20 messages/tick, atomically recording simulated receipts. Live rows are excluded from the mock ledger. Heavier work rotates across three minute phases: reply checks + follow-up preparation; one live-test job; storage/metadata cleanup. Persisted state resumes on the next turn. Backlogs cause delays; this is not exact wall-clock delivery.
 
-The live snapshot freezes recipient, content, selected account, attachments/checksums/names and logical message key. D1 claims/fences recheck approval, per-message auto consent, connection, controls and suppressions before the external side effect. Proven rejections allow at most three actual submissions with backoff/jitter. Limits are one/student/minute, ten/student/day and 100/application/day. Creation permits 50/student/day and 500/application/day, with retained-message caps of 100/student and 1000/application; capacity failure does not auto-delete history or buy storage. Live tests also require exact `LIVE_TEST_RECIPIENTS` matching.
+The live snapshot freezes recipient, content, selected account, attachments/checksums/names and logical message key. D1 claims/fences recheck approval, per-message auto consent, connection, controls and suppressions before the external side effect. Proven rejections allow at most three actual submissions with backoff/jitter. Limits are one/student/minute, ten/student/day and 100/application/day. Creation permits 50/student/day and 500/application/day, with active workspace caps of 400/student and 4000/application after migration 0018; initial drafts and planned follow-ups reserve slots, while terminal historical records are retained outside active capacity. Capacity failure does not auto-delete history or buy storage. See docs/MESSAGE-CAPACITY-RELEASE.md. Live tests also require exact `LIVE_TEST_RECIPIENTS` matching.
 
 Timeout/network/5xx ambiguity or an interrupted submitting lease becomes **uncertain**, never blindly resent. Gmail reconciliation uses stable RFC Message-ID; Graph uses a custom outreach header in recent Sent Items. Graph 202 means accepted, not confirmed. Its bounded lookup examines the most recent 25 sent items; absent/ambiguous evidence stays uncertain and requires review. Cancellation cannot undo an already accepted provider request.
 

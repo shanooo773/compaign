@@ -85,3 +85,11 @@ tokens/
 # Public synthetic workbook; private Excel files remain ignored.
 !/apps/web/public/professors-email-template.xlsx
 /auth-release-build/
+/google-activation-build/
+/google-activation-original-build/
+
+# Encrypted production backups are private even outside Wrangler state.
+*.dpapi
+
+# Synthetic Excel date-cell regression fixtures (no personal data).
+!/apps/api/tests/fixtures/scheduled-date-*.xlsx

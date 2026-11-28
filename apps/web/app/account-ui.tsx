@@ -14,6 +14,8 @@ import {
   ArrowUpRight,
   Mail,
 } from "lucide-react";
+import { GoogleActivationAction } from "./google-activation-ui";
+import { DeveloperIntroduction } from "./developer-introduction";
 import { passwordStrength } from "../../../shared/password-policy";
 export type Api = (
   path: string,
@@ -160,27 +162,8 @@ export function AuthPanel({
         </span>
       </a>
       <div className="auth-layout">
-        <section className="auth-story">
-          <span className="eyebrow">RESEARCH WITH INTENTION</span>
-          <h1>
-            Big ideas.
-            <br />
-            Thoughtful connections.
-          </h1>
-          <p>
-            A private home for your academic story, your research shortlist, and
-            the conversations that come next.
-          </p>
-          <ul>
-            <li>Keep your documents private</li>
-            <li>Review every word before outreach</li>
-            <li>Plan across time zones with confidence</li>
-          </ul>
-          <span className="story-note">
-            <ShieldCheck size={20} /> You stay in control of every send.
-          </span>
-        </section>
-        <section className="auth-card">
+        <section className="auth-introduction"><a className="brand" href="/">Professor Agent</a><h1>Thoughtful outreach.<br/>Meaningful opportunities.</h1><p>Organize your research contacts, review your emails, and follow up with care.</p><ul><li>Campaigns built around your research goals</li><li>Clear schedules and careful approvals</li><li>Your documents and conversations, together</li></ul><small>Private by design. You choose when to send.</small></section>
+        <section className="auth-card" id="account-access" tabIndex={-1}>
           <span className="eyebrow">YOUR ACADEMIC JOURNEY</span>
           <h2>{title}</h2>
           {!intent && (
@@ -262,6 +245,12 @@ export function AuthPanel({
               {!intent && (
                 <label>
                   Email address
+                  {mode === "signup" && (
+                    <small>
+                      Use your Gmail or Google Workspace email. After login,
+                      verify with the matching Google account and connect Gmail.
+                    </small>
+                  )}
                   <input
                     name="email"
                     type="email"
@@ -401,86 +390,13 @@ function LoginPassword() {
     </span>
   );
 }
-export function VerificationGate({
-  account,
-  ready,
-  api,
-  refresh,
-}: {
-  account: Identity;
-  ready: boolean;
-  api: Api;
-  refresh: () => Promise<void>;
-}) {
-  const [manage, setManage] = useState(false);
-  const [message, setMessage] = useState(""),
-    [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
-  return (
-    <main className="auth">
-      <section className="auth-card">
-        <Mail size={34} />
-        <span className="eyebrow">ONE MORE STEP</span>
-        <h1>Verify your email</h1>
-        <button className="text-link" onClick={() => setManage(!manage)}>
-          Manage account or delete pending account
-        </button>
-        {manage && (
-          <AccountSettings account={account} api={api} refresh={refresh} />
-        )}
-        <p>
-          Welcome, {account.first_name}. Your dashboard, profile, professors and
-          private documents are available. Mailbox actions require verified
-          ownership of {account.email}.
-        </p>
-        <p className="helper">
-          {ready
-            ? "Check your inbox and spam folder. Links expire after 24 hours."
-            : "Email verification delivery is unavailable. Your private workspace remains accessible; Gmail connections, sending and campaign approvals remain restricted."}
-        </p>
-        <Notice text={error} error />
-        <Notice text={message} />
-        <button
-          className="primary"
-          disabled={busy || !ready}
-          onClick={async () => {
-            setBusy(true);
-            try {
-              setMessage(
-                (await api("/auth/resend-verification", "POST")).message,
-              );
-            } catch (e) {
-              setError((e as Error).message);
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          {ready
-            ? "Resend verification email"
-            : "Verification email unavailable"}
-        </button>
-        <button className="secondary" disabled={busy} onClick={() => refresh()}>
-          Check verification status
-        </button>
-        <button
-          className="text-link"
-          onClick={async () => {
-            await api("/auth/logout", "POST");
-            await refresh();
-          }}
-        >
-          Sign out
-        </button>
-      </section>
-    </main>
-  );
-}
 export function AccountSettings({
+  ready = false,
   account,
   api,
   refresh,
 }: {
+  ready?: boolean;
   account: Identity;
   api: Api;
   refresh: () => Promise<void>;
@@ -525,11 +441,20 @@ export function AccountSettings({
       </p>
       {!account.email_verified_at && (
         <p className="helper">
-          Email Not Verified. Verification email delivery is currently
-          unavailable. Your private workspace is available; sensitive mailbox
-          actions remain restricted under the existing account policy.
+          Use Verify with Google & Connect Gmail below to prove ownership of
+          your registered email. Google must provide matching verified Gmail or
+          Google Workspace evidence. No accounts are merged automatically.
         </p>
       )}
+      {!account.email_verified_at && (
+        <GoogleActivationAction api={api} ready={ready} refresh={refresh} />
+      )}
+      <p className="helper">
+        Account recovery: keep a registered passkey or saved recovery codes.
+        Google activation does not reset your local password or replace
+        recovery. Email-based password reset is currently unavailable when
+        transactional delivery is disabled.
+      </p>
       <form
         key={account.display_name}
         onSubmit={(e) => {
@@ -684,8 +609,10 @@ export function PolicyNotice({
         <p>
           The application stores your account, academic profile, professor
           records, drafts, private documents and connected-provider tokens.
-          Documents are access controlled and expire after 30 days. Tokens are
-          encrypted. Hosting uses Vercel and Cloudflare. Configured
+          Documents are access controlled and normally expire after 30 days.
+          Files selected for approved campaigns are privately retained while
+          their approved messages remain active, including retry time. Tokens
+          are encrypted. Hosting uses Vercel and Cloudflare. Configured
           transactional delivery processes your address and account link; AI
           receives selected context only when enabled and used. Provider consent
           screens describe mailbox permissions.

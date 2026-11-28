@@ -1,4 +1,10 @@
 import {
+  isActivationProof,
+  verifiedGoogleIdentity,
+  commitGoogleActivation,
+  type GoogleActivationProof,
+} from "./google-activation";
+import {
   type Env,
   HttpError,
   base64,
@@ -131,11 +137,40 @@ export async function startOAuth(
   req: Request,
   provider: ProviderName,
   readReplies: boolean,
+  activation = false,
 ) {
   const config = credentials(env, provider),
     state = random(),
     verifier = random(),
     binding = random();
+  let activationProof: GoogleActivationProof | null = null;
+  if (activation) {
+    if (provider !== "gmail" || !readReplies)
+      throw new HttpError(
+        400,
+        "Google activation requires Gmail sending and reply permissions.",
+      );
+    const account = await env.DB.prepare(
+      "SELECT email,email_verified_at,legacy_access FROM users WHERE id=?",
+    )
+      .bind(user)
+      .first<{
+        email: string;
+        email_verified_at: number | null;
+        legacy_access: number;
+      }>();
+    if (!account || account.email_verified_at || account.legacy_access)
+      throw new HttpError(
+        409,
+        "This activation action is for new unverified accounts. Existing accounts should use their normal Gmail connection controls.",
+      );
+    activationProof = {
+      purpose: "google_activation",
+      verifier,
+      nonce: random(),
+      email: account.email.toLowerCase(),
+    };
+  }
   // Identity comes from the authenticated session, never request/profile fields.
   // Removing an ID restores the normal limit without deleting its usage row.
   const accountLimit = (env.OAUTH_ADMIN_TEST_USER_IDS || "")
@@ -188,7 +223,11 @@ export async function startOAuth(
       provider,
       await hash(cookie(req, "session")),
       await hash(binding),
-      await encrypt(env, `${user}:${provider}:pkce`, verifier),
+      await encrypt(
+        env,
+        `${user}:${provider}:pkce`,
+        activationProof || verifier,
+      ),
       +readReplies,
       Date.now() + 600000,
     )
@@ -200,10 +239,16 @@ export async function startOAuth(
     redirect_uri: config.redirect,
     scope: scopes(provider, readReplies).join(" "),
     state,
+    ...(activationProof
+      ? { nonce: activationProof.nonce, login_hint: activationProof.email }
+      : {}),
     code_challenge: challenge,
     code_challenge_method: "S256",
     ...(provider === "gmail"
-      ? { access_type: "offline", prompt: "consent" }
+      ? {
+          access_type: "offline",
+          prompt: activation ? "consent select_account" : "consent",
+        }
       : { response_mode: "query" }),
   }).toString();
   return Response.json(
@@ -222,6 +267,7 @@ export async function finishOAuth(
   network: Fetcher = fetch,
 ) {
   let category = "configuration";
+  let activationCallback = false;
   try {
     const config = credentials(env, provider),
       url = new URL(req.url),
@@ -254,6 +300,13 @@ export async function finishOAuth(
       .first();
     if (!active)
       throw new HttpError(401, "Session expired; sign in and reconnect.");
+    category = "pkce_decryption";
+    const earlyProof = await decrypt<string | GoogleActivationProof>(
+      env,
+      `${row.user_id}:${provider}:pkce`,
+      row.verifier,
+    );
+    activationCallback = isActivationProof(earlyProof);
     category = "state_consumption";
     const consumed = await env.DB.prepare(
       "DELETE FROM oauth_states WHERE state_hash=? RETURNING state_hash",
@@ -265,11 +318,17 @@ export async function finishOAuth(
     if (url.searchParams.has("error") || !url.searchParams.get("code"))
       throw new HttpError(400, "Account authorization was not completed.");
     category = "pkce_decryption";
-    const verifier = await decrypt<string>(
+    const storedProof = await decrypt<string | GoogleActivationProof>(
       env,
       `${row.user_id}:${provider}:pkce`,
       row.verifier,
     );
+    const activationProof = isActivationProof(storedProof) ? storedProof : null;
+    if (typeof storedProof !== "string" && !activationProof)
+      throw new HttpError(400, "Invalid OAuth proof.");
+    const verifier = activationProof
+      ? activationProof.verifier
+      : (storedProof as string);
     category = "token_exchange";
     const tokens = (await oauthTokenRequest(
       oauthConfig(provider).token,
@@ -310,6 +369,52 @@ export async function finishOAuth(
       )
     )
       throw new HttpError(400, "Required mailbox scopes were not granted.");
+    if (activationProof) {
+      category = "google_activation_identity";
+      if (provider !== "gmail")
+        throw new HttpError(400, "Invalid Google activation provider.");
+      const requiredIdentity = [
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+      ];
+      if (
+        !granted.includes("openid") ||
+        !(granted.includes("email") || granted.includes(requiredIdentity[1]))
+      )
+        throw new HttpError(400, "Google identity scopes were not granted.");
+      const identity = await verifiedGoogleIdentity(
+        env,
+        tokens,
+        activationProof,
+        network,
+      );
+      // ID tokens are short-lived identity evidence, not stored mailbox credentials.
+      const mailboxTokens = {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_in: tokens.expires_in,
+        scope: tokens.scope,
+      };
+      const encrypted = await encrypt(
+        env,
+        context(row.user_id, provider),
+        mailboxTokens,
+      );
+      category = "google_activation_commit";
+      const response = await commitGoogleActivation(
+        env,
+        row,
+        identity,
+        granted.join(" "),
+        encrypted,
+        tokens.expires_in,
+      );
+      response.headers.append(
+        "Set-Cookie",
+        `oauth_${provider}_${stateHash}=; HttpOnly; Secure; SameSite=Lax; Path=/api/oauth/${provider}/callback; Max-Age=0`,
+      );
+      return response;
+    }
     category = "identity_request";
     const identity = await providerRequest(
       provider === "gmail"
@@ -375,6 +480,21 @@ export async function finishOAuth(
   } catch (error) {
     // Fixed categories only: never serialize errors, requests, headers or provider payloads.
     console.warn("oauth_callback_failure", category);
+    if (activationCallback) {
+      const message =
+        error instanceof HttpError
+          ? error.message
+          : "Google verification could not be completed. Your account remains restricted. Return to the dashboard and retry. Google may require OAuth test-user access or application verification.";
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location:
+            env.APP_ORIGIN +
+            "/?activation_error=" +
+            encodeURIComponent(message),
+        },
+      });
+    }
     throw error;
   }
 }

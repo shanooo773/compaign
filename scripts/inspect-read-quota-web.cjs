@@ -1,0 +1,7 @@
+﻿const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),crypto=require('node:crypto');
+(async()=>{const auth=JSON.parse(fs.readFileSync(path.join(process.env.APPDATA,'com.vercel.cli/Data/auth.json'))),p=JSON.parse(fs.readFileSync('.vercel/project.json'));async function api(route){const r=await fetch('https://api.vercel.com'+route,{headers:{Authorization:'Bearer '+auth.token},signal:AbortSignal.timeout(30000)});assert(r.ok,'Vercel read '+r.status);return r.json();}
+ const deployment=await api('/v13/deployments/ms-professor-agent-malang43.vercel.app?teamId='+p.orgId),files=await api('/v6/deployments/'+deployment.id+'/files?teamId='+p.orgId);
+ const flat=(nodes,parent='')=>nodes.flatMap(n=>n.type==='directory'?flat(n.children,parent+'/'+n.name):[{path:(parent+'/'+n.name).replace(/^\/src\//,''),uid:n.uid}]);const source=flat(files);const mismatches=[];let compared=0;
+ for(const item of source.filter(x=>x.path.startsWith('apps/web/')&&!x.path.includes('/node_modules/')&&!x.path.includes('/.next/'))){if(!fs.existsSync(item.path))mismatches.push(item.path);else{compared++;if(crypto.createHash('sha1').update(fs.readFileSync(item.path)).digest('hex')!==item.uid)mismatches.push(item.path);}}
+ fs.writeFileSync('apps/api/.wrangler/read-quota-web-baseline.json',JSON.stringify({deployment,files,compared,mismatches},null,2));console.log(JSON.stringify({deployment:deployment.id,sourceFiles:source.length,compared,mismatches}));
+})().catch(e=>{console.error(e.message);process.exitCode=1;});

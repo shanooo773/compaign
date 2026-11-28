@@ -27,6 +27,7 @@ export type MailEvent = {
   receivedAt: string;
   text: string;
   bounce: boolean;
+  labels?: string[];
 };
 export class ProviderError extends Error {
   constructor(
@@ -307,12 +308,15 @@ export interface EmailProvider {
     access: string,
     thread: string,
     cursor?: string | null,
+    context?: {recipient:string;key:string;sentAt:string},
   ): Promise<{ events: MailEvent[]; cursor: string | null }>;
 }
 export function emailProvider(
   provider: ProviderName,
   network: Fetcher = fetch,
 ): EmailProvider {
+  // Per-provider-instance cache; never shared between users or scheduler invocations.
+  const reads=new Map<string,Promise<any>>();
   const auth = (access: string) => ({ Authorization: `Bearer ${access}` });
   const request = (
     url: string,
@@ -329,6 +333,24 @@ export function emailProvider(
   if (provider === "gmail")
     return {
       async send(access, envelope) {
+        if (
+          envelope.attachments.length > 3 ||
+          envelope.attachments.reduce(
+            (total, file) => total + file.bytes.byteLength,
+            0,
+          ) >
+            2 * 1024 * 1024
+        )
+          throw new HttpError(
+            400,
+            "Email attachments exceed the 3-file / 2 MiB message limit.",
+          );
+        const encodedMessage = new TextEncoder().encode(mime(envelope));
+        if (encodedMessage.byteLength > 4 * 1024 * 1024)
+          throw new HttpError(
+            400,
+            "Encoded email exceeds the safe 4 MiB message limit.",
+          );
         const result = await request(
           "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
           access,
@@ -336,7 +358,7 @@ export function emailProvider(
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              raw: base64url(new TextEncoder().encode(mime(envelope))),
+              raw: base64url(encodedMessage),
               ...(envelope.threadId ? { threadId: envelope.threadId } : {}),
             }),
           },
@@ -376,29 +398,41 @@ export function emailProvider(
             : {}),
         };
       },
-      async replies(access, thread) {
+      async replies(access, thread, cursor, context) {
+        const metadata = "format=metadata&metadataHeaders=From&metadataHeaders=Content-Type&metadataHeaders=Auto-Submitted&metadataHeaders=Message-ID&metadataHeaders=In-Reply-To&metadataHeaders=References&fields=id,threadId,labelIds,internalDate,snippet,payload(headers)";
         const result = await request(
-          `https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(thread)}?format=metadata&metadataHeaders=From&metadataHeaders=Content-Type&metadataHeaders=Auto-Submitted&fields=messages(id,internalDate,snippet,payload(headers))`,
+          `https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(thread)}?${metadata.replace("fields=id,threadId,labelIds,internalDate,snippet,payload(headers)","fields=messages(id,threadId,labelIds,internalDate,snippet,payload(headers))")}`,
           access,
         );
-        if ((result.messages || []).length > 100)
-          throw new ProviderError("retry");
+        if ((result.messages || []).length > 100) throw new ProviderError("retry");
+        const messages = new Map<string,any>((result.messages || []).map((m:any)=>[m.id,m]));
+        const header=(m:any,name:string)=>m.payload?.headers?.find((h:any)=>h.name.toLowerCase()===name)?.value || "";
+        const references=new Set<string>([context?.key, ...(result.messages || []).filter((m:any)=>m.labelIds?.includes("SENT")).map((m:any)=>header(m,"message-id"))].filter(Boolean).map((v:string)=>v.replace(/[<>]/g,"")));
+        let next:string|null=null;
+        if(context){
+          const since=Math.floor(Date.parse(context.sentAt)/1000);
+          if(!Number.isFinite(since) || !/^[^\s<>"()]+@[^\s<>"()]+$/.test(context.recipient)) throw new ProviderError("rejected");
+          const params=new URLSearchParams({includeSpamTrash:"true",maxResults:"5",q:`from:(${context.recipient}) after:${since}`});
+          if(cursor) params.set("pageToken",cursor);
+          const pageURL="https://gmail.googleapis.com/gmail/v1/users/me/messages?"+params;
+          if(!reads.has(pageURL)) reads.set(pageURL,request(pageURL,access));
+          const page=await reads.get(pageURL)!;
+          next=page.nextPageToken || null;
+          for(const candidate of page.messages || []){
+            if(messages.has(candidate.id)) continue;
+            const detailURL=`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(candidate.id)}?${metadata}`;
+            if(!reads.has(detailURL)) reads.set(detailURL,request(detailURL,access));
+            const m=await reads.get(detailURL)!;
+            const refs=(header(m,"in-reply-to")+" "+header(m,"references")).match(/<[^>]+>/g) || [];
+            if(m.threadId===thread || refs.some((ref:string)=>references.has(ref.slice(1,-1)))) messages.set(m.id,m);
+          }
+        }
         return {
-          events: (result.messages || []).slice(-100).map((m: any) => ({
-            id: m.id,
-            sender:
-              m.payload?.headers?.find(
-                (h: any) => h.name.toLowerCase() === "from",
-              )?.value || "",
-            receivedAt: new Date(Number(m.internalDate)).toISOString(),
-            text: m.snippet || "",
-            bounce: (m.payload?.headers || []).some(
-              (h: any) =>
-                h.name.toLowerCase() === "content-type" &&
-                /delivery-status|report-type=delivery-status/i.test(h.value),
-            ),
-          })),
-          cursor: null,
+          events: [...messages.values()].map((m:any)=>({
+            id:m.id,sender:header(m,"from"),receivedAt:new Date(Number(m.internalDate)).toISOString(),text:m.snippet || "",
+            labels:Array.isArray(m.labelIds)?m.labelIds:[],
+            bounce:/delivery-status|report-type=delivery-status/i.test(header(m,"content-type")),
+          })),cursor:next,
         };
       },
     };

@@ -50,7 +50,7 @@ export async function limitedWorkspaceState(env: Env, user: string) {
       .bind(user)
       .all(),
     env.DB.prepare(
-      "SELECT id,name,size,content_type,expires_at FROM documents WHERE user_id=? AND storage_state='ready' AND (expires_at IS NULL OR expires_at>?)",
+      "SELECT id,name,size,content_type,expires_at,retained_until FROM documents WHERE user_id=? AND storage_state='ready' AND (expires_at IS NULL OR MAX(expires_at,COALESCE(retained_until,0))>?)",
     )
       .bind(user, Date.now())
       .all(),

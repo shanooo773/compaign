@@ -1,0 +1,15 @@
+const fs=require('node:fs'),path=require('node:path');
+const dir='apps/api/.wrangler',root=dir+'/lifecycle-baseline';
+fs.mkdirSync(root+'/apps/api',{recursive:true});fs.cpSync('apps/api/src',root+'/apps/api/src',{recursive:true});fs.cpSync('shared',root+'/shared',{recursive:true});
+const p=root+'/apps/api/src/index.ts';let s=fs.readFileSync(p,'utf8');
+s=s.replace('import { deleteCampaignWorkspace } from "./campaign-deletion";\n','').replace('import { archiveCampaign, campaignIdleSQL } from "./campaign-archive";\n','');
+s=s.replace(/  const deleteCampaignMatch=[\s\S]*?(?=  if \(path === "\/api\/campaigns\/duplicate-check")/,'');
+s=s.replace(/,\(SELECT archived_at FROM campaign_archives[\s\S]*? can_archive,EXISTS/,',EXISTS');
+s=s.replace(" AND NOT EXISTS(SELECT 1 FROM campaign_workspace_deletions d WHERE d.campaign_id=c.id AND d.user_id=c.user_id AND d.state='deleted')",'');
+s=s.replace(" AND NOT EXISTS(SELECT 1 FROM message_authorizations auth JOIN campaign_workspace_deletions d ON d.campaign_id=auth.campaign_id AND d.user_id=auth.user_id WHERE auth.message_id=m.id AND d.state='deleted')",'');
+fs.writeFileSync(p,s);
+const m=root+'/apps/api/src/campaign-management.ts';s=fs.readFileSync(m,'utf8').replace(/ const deleted=await[\s\S]*?(?= const \{name\}=z.object)/,'');fs.writeFileSync(m,s);
+const automation=root+'/apps/api/src/automation.ts';s=fs.readFileSync(automation,'utf8').replace(" AND NOT EXISTS(SELECT 1 FROM message_authorizations auth JOIN campaign_workspace_deletions d ON d.campaign_id=auth.campaign_id AND d.user_id=auth.user_id WHERE auth.message_id=m.id AND d.state='deleted')",'');fs.writeFileSync(automation,s);
+const cfg=JSON.parse(fs.readFileSync(dir+'/management-config.json','utf8'));
+fs.writeFileSync(dir+'/lifecycle-baseline-config.json',JSON.stringify({...cfg,main:path.resolve(root+'/apps/api/src/index.ts')}));
+console.log('Isolated baseline source prepared; no production changes.');

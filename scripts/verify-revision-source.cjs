@@ -1,0 +1,6 @@
+const fs=require('node:fs'),assert=require('node:assert/strict'),ts=require('typescript'),{transformSync}=require('esbuild');
+const dir='apps/api/.wrangler',before=fs.readFileSync(dir+'/revision-live-before.js','utf8'),after=fs.readFileSync(dir+'/revision-build/index.js','utf8');
+function functions(source){const ast=ts.createSourceFile('worker.js',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.JS);return new Map(ast.statements.filter(ts.isFunctionDeclaration).filter(n=>n.name).map(n=>[n.name.text,transformSync(n.getText(ast),{loader:'js',minifyWhitespace:true,legalComments:'none'}).code]));}
+const old=functions(before),fresh=functions(after),changed=[],added=[];for(const [name,body] of old){assert(fresh.has(name),'Existing function removed: '+name);if(fresh.get(name)!==body)changed.push(name);}for(const name of fresh.keys())if(!old.has(name))added.push(name);
+const allowed=['route','approveGmail','duplicateHistory','queueSequence','runLiveJobs'];assert(changed.every(name=>allowed.includes(name)),'Unexpected existing function change: '+changed.filter(n=>!allowed.includes(n)).join(','));
+const result={existingFunctionsCompared:old.size,changedFunctions:changed,newFunctions:added,onlyReviewedExistingFunctionsChanged:true};fs.writeFileSync(dir+'/revision-source-verification.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result));

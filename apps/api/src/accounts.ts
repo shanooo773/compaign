@@ -5,7 +5,7 @@ import {
   sendPasswordChanged,
 } from "./account-mail";
 export { mailReady, sendAccountLink } from "./account-mail";
-import { revokeMailboxTokens } from "./oauth";
+import { revokeMailboxTokens, oauthAvailable } from "./oauth";
 import { z } from "zod";
 import { type Env, HttpError, hash, random, consume } from "./runtime";
 import { passwordHash, validPassword, equalHash } from "./passwords";
@@ -122,7 +122,7 @@ export async function accountPublic(
     return Response.json({
       ok: true,
       message:
-        "Account request complete. Sign in with your password to access your private workspace. Email Not Verified until ownership is confirmed.",
+        "Account request complete. Sign in with your password, then choose Verify with Google & Connect Gmail using your matching Google email. Your account remains unverified until ownership is confirmed.",
     });
   }
   if (path.endsWith("login")) {
@@ -277,7 +277,11 @@ export async function accountPrivate(
     )
       .bind(user)
       .first();
-    return Response.json({ account, mail_delivery_ready: mailReady(env) });
+    return Response.json({
+      account,
+      mail_delivery_ready: mailReady(env),
+      google_activation_ready: oauthAvailable(env, "gmail"),
+    });
   }
   if (path === "/api/auth/resend-verification" && method === "POST") {
     const row = await env.DB.prepare(
@@ -384,7 +388,7 @@ export async function accountPrivate(
       // One atomic transaction removes all private data and enqueues opaque storage cleanup.
       await env.DB.batch([
         env.DB.prepare(
-          "INSERT OR IGNORE INTO account_deletion_objects(object_key,backend,size,expires_at,next_at) SELECT object_key,storage_backend,size,COALESCE(expires_at,?),? FROM documents WHERE user_id=?",
+          "INSERT OR IGNORE INTO account_deletion_objects(object_key,backend,size,expires_at,next_at) SELECT object_key,storage_backend,size,MAX(COALESCE(expires_at,?),COALESCE(retained_until,0),COALESCE(object_expires_at,0)),? FROM documents WHERE user_id=?",
         ).bind(Date.now() + 30 * 86400000, Date.now() + 120000, user),
         env.DB.prepare("UPDATE profiles SET stopped=1 WHERE user_id=?").bind(
           user,
@@ -397,6 +401,8 @@ export async function accountPrivate(
           "oauth_states",
           "account_tokens",
           "mailbox_events",
+          "followup_steps",
+          "campaign_deletion_documents",
           "message_attachments",
           "transports",
           "automation",
@@ -412,7 +418,9 @@ export async function accountPrivate(
           "profiles",
         ].map((table) => {
           const sql =
-            table === "mailbox_events"
+            table === "followup_steps"
+              ? `DELETE FROM followup_steps WHERE root_id IN (SELECT id FROM messages WHERE user_id=?)`
+              : table === "mailbox_events"
               ? `DELETE FROM mailbox_events WHERE connection_id IN (SELECT id FROM connections WHERE user_id=?)`
               : ["automation", "deliveries"].includes(table)
                 ? `DELETE FROM ${table} WHERE message_id IN (SELECT id FROM messages WHERE user_id=?)`

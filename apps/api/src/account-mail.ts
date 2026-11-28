@@ -6,10 +6,8 @@ export function mailReady(env: Env) {
     env.MAIL_DELIVERY_ENABLED === "true" &&
     env.MAIL_FREE_PLAN_CONFIRMED === "true" &&
     env.MAIL_SENDER_VERIFIED === "true" &&
-    ((env.MAIL_PROVIDER === "brevo" && !!env.BREVO_API_KEY) ||
-      (env.MAIL_PROVIDER === "mailjet" &&
-        !!env.MAILJET_API_KEY &&
-        !!env.MAILJET_SECRET_KEY)) &&
+    env.MAIL_PROVIDER === "brevo" &&
+    !!env.BREVO_API_KEY &&
     address.safeParse(env.MAIL_FROM).success
   );
 }
@@ -67,95 +65,27 @@ async function deliver(
   network: typeof fetch,
 ) {
   const email = accountEmail(kind, link);
-  const mailjet = env.MAIL_PROVIDER === "mailjet";
-  const response = await network(
-    mailjet
-      ? "https://api.mailjet.com/v3.1/send"
-      : "https://api.brevo.com/v3/smtp/email",
-    {
-      method: "POST",
-      redirect: "manual",
-      signal: AbortSignal.timeout(10000),
-      headers: mailjet
-        ? {
-            Authorization:
-              "Basic " +
-              btoa(env.MAILJET_API_KEY + ":" + env.MAILJET_SECRET_KEY),
-            "Content-Type": "application/json",
-          }
-        : { "api-key": env.BREVO_API_KEY!, "Content-Type": "application/json" },
-      body: JSON.stringify(
-        mailjet
-          ? {
-              Messages: [
-                {
-                  From: { Email: env.MAIL_FROM, Name: "MS Professor Agent" },
-                  To: [{ Email: user.email }],
-                  Subject: email.subject,
-                  TextPart: email.textContent,
-                  HTMLPart: email.htmlContent,
-                  TrackOpens: "disabled",
-                  TrackClicks: "disabled",
-                },
-              ],
-            }
-          : {
-              sender: { email: env.MAIL_FROM, name: "MS Professor Agent" },
-              to: [{ email: user.email }],
-              ...email,
-              tags: ["account-" + kind],
-            },
-      ),
+  const response = await network("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    redirect: "manual",
+    signal: AbortSignal.timeout(10000),
+    headers: {
+      "api-key": env.BREVO_API_KEY!,
+      "Content-Type": "application/json",
     },
-  );
-  // 5xx can follow acceptance: do not discard a possibly delivered token.
-  if (response.status >= 500) {
-    await response.body?.cancel();
-    throw new Error("Ambiguous account delivery");
-  }
-  let accepted = response.status === (mailjet ? 200 : 201),
-    providerId = "",
-    failureCode = "http_" + response.status;
-  if (accepted && mailjet) {
-    const raw = await response.text();
-    const result = JSON.parse(raw);
-    const message = result.Messages?.[0];
-    if (
-      !Array.isArray(result.Messages) ||
-      result.Messages.length !== 1 ||
-      !["success", "error"].includes(message?.Status)
-    )
-      throw new Error("Ambiguous account delivery");
-    accepted = message.Status === "success";
-    if (
-      !accepted &&
-      /^[a-z0-9_-]{1,50}$/i.test(message.Errors?.[0]?.ErrorCode || "")
-    )
-      failureCode = message.Errors[0].ErrorCode;
-    if (accepted) {
-      // Mailjet IDs can exceed Number.MAX_SAFE_INTEGER: retain the exact digits.
-      providerId = /"MessageID"\s*:\s*"?(\d+)"?/.exec(raw)?.[1] || "";
-      if (message.To?.length !== 1 || !providerId || !message.To[0].MessageUUID)
-        throw new Error("Ambiguous account delivery");
-    }
-  } else if (
-    mailjet &&
-    !accepted &&
-    response.status >= 400 &&
-    response.status < 500
-  ) {
-    // Retain only documented error codes, never provider text/links/credentials.
-    try {
-      const error = (await response.json()) as any;
-      const code =
-        error.ErrorCode || error.Messages?.[0]?.Errors?.[0]?.ErrorCode;
-      if (/^(mj|send)-[a-z0-9-]{1,32}$/i.test(code || "")) failureCode = code;
-    } catch {
-      /* HTTP status remains the safe diagnostic. */
-    }
-  } else await response.body?.cancel();
+    body: JSON.stringify({
+      sender: { email: env.MAIL_FROM, name: "MS Professor Agent" },
+      to: [{ email: user.email }],
+      ...email,
+      tags: ["account-" + kind],
+    }),
+  });
+  // A server error may follow acceptance; retain the expiring token without retrying.
+  await response.body?.cancel();
+  if (response.status >= 500) throw new Error("Ambiguous account delivery");
+  const accepted = response.status === 201;
   if (!accepted) console.warn("account_mail_failure", "provider_rejected");
-  return { accepted, providerId, failureCode };
+  return { accepted };
 }
 
 export async function sendAccountLink(
@@ -167,12 +97,8 @@ export async function sendAccountLink(
   if (!mailReady(env)) return;
   try {
     const canonical = origin(env);
-    // Shared across account mail types; Mailjet Free has a 200/day cap.
-    await consume(
-      env,
-      "account:mail:global",
-      env.MAIL_PROVIDER === "mailjet" ? 180 : 250,
-    );
+    // Shared across verification, recovery and password-change notifications.
+    await consume(env, "account:mail:global", 250);
     const token = random(),
       digest = await hash(token),
       expires = Date.now() + (purpose === "verify" ? 86400000 : 1800000);
@@ -194,20 +120,6 @@ export async function sendAccountLink(
       await env.DB.prepare("DELETE FROM account_tokens WHERE token_hash=?")
         .bind(digest)
         .run();
-    if (env.MAIL_PROVIDER === "mailjet")
-      await env.DB.prepare(
-        "INSERT INTO audit(id,user_id,action,entity_id) VALUES(?,?,?,?)",
-      )
-        .bind(
-          crypto.randomUUID(),
-          user.id,
-          "account.mail." +
-            purpose +
-            (receipt.accepted ? ".accepted" : ".rejected"),
-          "mailjet:" +
-            (receipt.accepted ? receipt.providerId : receipt.failureCode),
-        )
-        .run();
   } catch {
     console.warn("account_mail_failure", "transport_or_setup");
   }
@@ -220,11 +132,7 @@ export async function sendPasswordChanged(
   if (!mailReady(env)) return;
   try {
     const canonical = origin(env);
-    await consume(
-      env,
-      "account:mail:global",
-      env.MAIL_PROVIDER === "mailjet" ? 180 : 250,
-    );
+    await consume(env, "account:mail:global", 250);
     await deliver(env, user, "changed", canonical, network);
   } catch {
     console.warn("account_mail_failure", "transport_or_setup");

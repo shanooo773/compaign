@@ -28,8 +28,6 @@ Automated checks cover cryptographically signed synthetic WebAuthn responses, wr
 
 Native Workers runtime checks exercise real WebAuthn cryptography and intercepted Turnstile Siteverify, plus Gmail send/threading/reply/profile/token HTTP. Local Chromium checks use an isolated database and virtual authenticator; no production account or real email is created.
 
-A managed Cloudflare widget was created for `ms-professor-agent-malang43.vercel.app` and its secret installed directly into the existing Worker. A genuine automated browser challenge timed out; production enforcement remains disabled. Do not claim bot protection active until a genuine challenge passes Siteverify. No Mailjet activation is authorized; transactional sending stays disabled.
-
 Automatic approval review rejected changing the existing workspace verification gate, including an explicit dashboard/profile/professor/private-document route allowlist. The user was asked for explicit approval of that scope. Until approved, new accounts can register and sign in but remain workspace-gated; pending accounts are preserved. This requested registration-access change is not represented as completed.
 
 Deployment identifiers and final check counts are recorded after release.
@@ -43,8 +41,6 @@ Application source commit: `404cd55bed42a4b99c77b693dbb0967aec3b04bc`, pushed to
 Migration `0007_auth_options.sql` applied successfully to production. Worker version `e70b7eb6-7ac5-4718-ae68-26066e05fb32` is deployed on the unchanged service and minute cron. The retrieved deployed module exactly matches the reviewed bundle, SHA-256 `434f48d19ac6fdfee1f7b7de95dc7cb963a0b0ec03205183e0a16e11f0e9cb2a`.
 
 Vercel automatically deployed application commit 404cd55 and reported READY as deployment `dpl_3ZDnRRCP5QoNCNsqnWJa636oA9Zw`, retaining the canonical URL. Canonical production assets include the recovery/passkey and separate-follow-up approval UI and the Turnstile CSP entries. Direct Worker and Vercel proxy checks both passed: Gmail provider/live status and mailbox readiness, KV storage, required passkey user verification and canonical RP ID, no-store caching, authentication denial and foreign-origin denial.
-
-Post-deploy stable fingerprints match for existing account/password records, documents, Gmail connection identities/status/scopes, deliveries, original authorizations and campaign selections. Existing provider token material was not rewritten; normal provider-managed refreshes are excluded from stable identity fingerprints. Original send timestamps/provider/thread IDs and reply status are unchanged. No new delivery was introduced by testing or deployment. Existing credentials/Groq settings and outreach activation are preserved. Mailjet delivery remains disabled.
 
 ### Remaining owner actions
 
