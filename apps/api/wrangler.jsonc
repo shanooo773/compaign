@@ -6,8 +6,8 @@
   "compatibility_date": "2026-10-01",
   "vars": {
     "APP_ORIGIN": "https://ms-professor-agent-six.vercel.app",
-    "OAUTH_ENABLED": "false",
-    "LIVE_EMAIL_ENABLED": "false",
+    "OAUTH_ENABLED": "true",
+    "LIVE_EMAIL_ENABLED": "true",
     "MOCK_DELIVERY_ENABLED": "false",
     "AI_PROVIDER": "mock",
     "GROQ_FREE_PLAN_CONFIRMED": "false",
