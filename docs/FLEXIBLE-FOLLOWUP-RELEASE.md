@@ -1,3 +1,5 @@
+> Historical release record. Current limits, templates, timezone handling and safety behavior are documented in [Excel-driven follow-up upgrade](EXCEL-FOLLOWUP-UPGRADE.md).
+
 # Flexible follow-ups and scheduler repair
 
 Release date: October 29, 2026 (Asia/Karachi).
@@ -40,12 +42,6 @@ Download `/professors-email-template.xlsx` or `.csv`. All timestamps are UTC ISO
 The workbook includes a controlled example using previous-step minute delays `[5,10,15,30,30]`, corresponding nominally to 5,15,30,60,90 minutes after the initial send. Actual previous-step schedules account for actual sending delays. Conflicting formats, gaps, invalid intervals, empty content, non-increasing schedules and conflicting duplicate recipients are rejected. Identical duplicate rows remain safely deduplicated for compatibility.
 
 ## Verification
-
-- 285 automated API tests passed across 16 files, including 5/10-minute, hourly/daily timing; five-step delivery; replies at all five stages; distinct-thread replies; authorization immutability; duplicate queue/send prevention; provider failures; existing leased/restart recovery and campaigns; OAuth refresh classification; and a five-thread send within the 50-subrequest allowance.
-- Both workspaces typecheck; the production Next.js build passed.
-- `node scripts/followup-runtime.cjs` passes in native Workers runtime with real local D1 bindings, all migrations, exact step authorization, Gmail threading, repeated queue/send calls and the scheduled handler. All provider traffic is intercepted; no real mail.
-- Existing browser regression passes actual XLSX upload, Manual and AI fallback preparation, complete/individual campaign approval, persisted success, cancellation and mobile layout with synthetic accounts.
-- Migration `0009_followup_sequences.sql` is additive. Production verification compares current variables/binding metadata and protected-record hashes. Mailjet, Turnstile, passkeys, recovery codes, Groq, account data, documents and existing approvals are not reconfigured.
 
 ## Deployment evidence
 

@@ -12,12 +12,14 @@ async function main() {
     import {encrypt} from './apps/api/src/oauth';
     import {queueSequence} from './apps/api/src/followup-sequence';
     import {runLiveJobs} from './apps/api/src/automation';
+    import {cleanDocuments} from './apps/api/src/storage';
     export default {async fetch(req,env) {
       const route=new URL(req.url).pathname;
       if(route.startsWith('/api/'))return worker.fetch(req,env);
       if(route==='/tokens')return Response.json({tokens:await encrypt(env,'runtime-user:gmail:tokens:v1',{access_token:'synthetic',refresh_token:'synthetic',expires_in:3600})});
       if(route==='/queue')await queueSequence(env);
       if(route==='/send')await runLiveJobs(env);
+      if(route==='/clean')await cleanDocuments(env);
       if(route==='/cron')await worker.scheduled({cron:'* * * * *',scheduledTime:Date.now()},env);
       return Response.json({ok:true});
     }};`;
@@ -29,6 +31,7 @@ async function main() {
     platform: "browser",
   });
   let submissions = 0;
+  const captured = [];
   const mf = new Miniflare(
     convertV4MiniflareOptions({
       modules: true,
@@ -50,14 +53,19 @@ async function main() {
         if (request.url.includes("/messages/send")) {
           submissions++;
           const body = await request.json();
-          assert.equal(body.threadId, "runtime-thread");
+          if (body.threadId) assert.equal(body.threadId, "runtime-thread");
           const mime = Buffer.from(body.raw, "base64url").toString();
-          assert.match(
-            mime,
-            /In-Reply-To: <runtime-original@ms-professor-agent.invalid>/,
-          );
+          captured.push(mime);
+          if (body.threadId)
+            assert.match(
+              mime,
+              /In-Reply-To: <runtime-original@ms-professor-agent.invalid>/,
+            );
           return Response.json({
-            id: "runtime-followup",
+            id:
+              submissions === 1
+                ? "runtime-followup"
+                : "runtime-followup-" + submissions,
             threadId: "runtime-thread",
           });
         }
@@ -232,6 +240,124 @@ async function main() {
     assert.equal(repeated.created, 1);
     assert.notEqual(repeated.drafts[0].id, first.drafts[0].id);
     assert.equal(submissions, 1);
+
+    const docs = [];
+    for (const [name, content] of [
+      ["cv.txt", "Synthetic CV attachment"],
+      ["transcript.txt", "Synthetic transcript"],
+    ]) {
+      const form = new FormData();
+      form.set("file", new File([content], name, { type: "text/plain" }));
+      const serialized = new Request(
+        "https://synthetic.invalid/api/documents",
+        { method: "POST", body: form },
+      );
+      const uploaded = await mf.dispatchFetch(serialized.url, {
+        method: "POST",
+        headers: {
+          Origin: "https://synthetic.invalid",
+          Cookie: "session=" + session,
+          "Content-Type": serialized.headers.get("Content-Type"),
+        },
+        body: await serialized.arrayBuffer(),
+      });
+      assert.equal(uploaded.status, 200, await uploaded.clone().text());
+      docs.push((await uploaded.json()).id);
+    }
+    const connection = require("node:crypto").randomUUID();
+    await db
+      .prepare(
+        "INSERT INTO connections(id,user_id,provider,address,subject,scopes,tokens,expires_at) VALUES(?,'runtime-user','gmail','attachment-sender@example.invalid','attachment-mailbox','gmail.send gmail.readonly',?,?)",
+      )
+      .bind(connection, tokens.tokens, Date.now() + 3600000)
+      .run();
+    await db
+      .prepare(
+        "INSERT INTO mailbox_checks(connection_id,checked_at,status,detail) VALUES(?,?,'ready','Isolated attachment test')",
+      )
+      .bind(connection, Date.now())
+      .run();
+    const imported = await request("/imports/drafts", {
+      import_id: require("node:crypto").randomUUID(),
+      rows: [
+        {
+          name: "Attachment professor",
+          email: "controlled@example.invalid",
+          subject: "Approved attachment inquiry",
+          body: "Exact content",
+          scheduled_at: "2000-01-01T00:00:00Z",
+          timezone: "Asia/Karachi",
+          follow_up_sequence: JSON.stringify(
+            Array.from({ length: 10 }, (_, n) => ({
+              subject: "Step " + (n + 1),
+              body: "Exact step content",
+              delay_value: 6,
+              delay_unit: "days",
+              relative_to: "previous",
+            })),
+          ),
+        },
+      ],
+    });
+    const approvalBody = {
+      ids: [imported.drafts[0].id],
+      sending_account_id: connection,
+      authorize_followups: true,
+      attachment_selection: { initial: docs, followups: { 10: [docs[0]] } },
+    };
+    const dry = await request("/messages/approve", {
+      ...approvalBody,
+      dry_run: true,
+    });
+    assert.equal(dry.would_authorize_followups, 10);
+    assert.equal(
+      (
+        await db
+          .prepare("SELECT count(*) n FROM campaign_attachment_pins")
+          .first()
+      ).n,
+      0,
+    );
+    const approved = await request("/messages/approve", approvalBody);
+    assert.equal(approved.authorized_followups, 10);
+    assert.equal(
+      (
+        await db
+          .prepare("SELECT count(*) n FROM campaign_attachment_pins")
+          .first()
+      ).n,
+      2,
+    );
+    assert(
+      (
+        await db
+          .prepare(
+            "SELECT MIN(retained_until) expiry FROM campaign_attachment_pins",
+          )
+          .first()
+      ).expiry >
+        Date.now() + 66 * 86400000,
+    );
+    await db.exec("DELETE FROM usage_counters WHERE scope LIKE 'send:%'");
+    const sent = await mf.dispatchFetch("http://localhost/send");
+    assert.equal(sent.status, 200, await sent.text());
+    assert.equal(submissions, 2);
+    assert.match(captured.at(-1), /filename\*=UTF-8''cv.txt/);
+    assert.match(captured.at(-1), /filename\*=UTF-8''transcript.txt/);
+    await request("/campaigns/" + approved.campaign_id + "/cancel", {});
+    await mf.dispatchFetch("http://localhost/clean");
+    assert.equal(
+      (
+        await db
+          .prepare("SELECT count(*) n FROM campaign_attachment_pins")
+          .first()
+      ).n,
+      0,
+    );
+    console.log(
+      "PASS native Workers/D1/KV: 60-day ten-step campaign, two private uploaded documents, dry-run without pins, single approval with exact attachment plan, retained private bytes, actual MIME file parts, campaign cancellation and pin cleanup. Provider traffic intercepted.",
+    );
+
     console.log(
       "PASS native Workers runtime and D1: all migrations, new import after cancellation, idempotent import retries, exact step approval, 5-minute due time, Gmail threading, duplicate queue/send prevention and scheduled handler health. All provider traffic intercepted; no real mail.",
     );

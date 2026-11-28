@@ -1,3 +1,6 @@
+// Increase this shared limit and regenerate templates to support longer campaigns.
+export const MAX_FOLLOWUPS = 10;
+export const MAX_SEQUENCE_DAYS = 60;
 export type FollowupStep = {
   subject: string;
   body: string;
@@ -14,8 +17,8 @@ export function delayMilliseconds(step: FollowupStep) {
 }
 
 export function validateSequence(value: unknown): FollowupStep[] {
-  if (!Array.isArray(value) || !value.length || value.length > 5)
-    throw new Error("A sequence requires 1-5 follow-up steps.");
+  if (!Array.isArray(value) || !value.length || value.length > MAX_FOLLOWUPS)
+    throw new Error(`A sequence requires 1-${MAX_FOLLOWUPS} follow-up steps.`);
   let offset = 0;
   return value.map((step, index) => {
     if (
@@ -37,9 +40,13 @@ export function validateSequence(value: unknown): FollowupStep[] {
       );
     const delay = delayMilliseconds(step);
     const next = step.relative_to === "original" ? delay : offset + delay;
-    if (delay > 30 * 86400000 || next <= offset || next > 30 * 86400000)
+    if (
+      delay > MAX_SEQUENCE_DAYS * 86400000 ||
+      next <= offset ||
+      next > MAX_SEQUENCE_DAYS * 86400000
+    )
       throw new Error(
-        "Follow-up schedules must increase and finish within 30 days.",
+        `Follow-up schedules must increase and finish within ${MAX_SEQUENCE_DAYS} days.`,
       );
     offset = next;
     return {

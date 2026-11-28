@@ -1,0 +1,8 @@
+"use client";
+import {useState} from 'react';
+import {ArrowRight,PenLine,ShieldCheck} from 'lucide-react';
+import {WorkflowProgress} from './ui';
+export function CreateCampaign({name,onName,onManual,children}:{name:string;onName:(name:string)=>void;onManual:()=>void;children:React.ReactNode}) {
+ const [step,setStep]=useState(1);
+ return <div className="create-workspace" data-tour="nav-Smart Import"><WorkflowProgress step={step}/>{step===1?<section className="panel campaign-details-form"><span className="section-kicker">Step 1 of 5</span><h2>Give your campaign a name</h2><p>A clear name keeps each research goal and application season together.</p><form onSubmit={event=>{event.preventDefault();if(name.trim())setStep(2);}}><label htmlFor="new-campaign-name">Campaign name<input id="new-campaign-name" value={name} required maxLength={160} onChange={event=>onName(event.target.value)} placeholder="e.g. Korea research opportunities - Fall 2027" autoComplete="off"/></label><div className="form-actions"><button className="primary" disabled={!name.trim()}>Continue to professors <ArrowRight size={16}/></button><span><ShieldCheck size={15}/>Creating a draft never sends an email.</span></div></form></section>:<><div className="creation-context"><div><span className="section-kicker">Step 2 of 5</span><h2>{name}</h2><p>Add professors using your preferred method, then review every email.</p></div><button className="text-link" onClick={()=>setStep(1)}>Edit campaign name</button><button className="secondary" onClick={onManual}><PenLine size={16}/>Add manually</button></div>{children}<p className="creation-footnote">Next: review emails, choose documents, and explicitly approve your final plan. Advanced import options remain available below.</p></>}</div>;
+}

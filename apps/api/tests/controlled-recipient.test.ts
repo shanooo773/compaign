@@ -75,7 +75,7 @@ const validate = () =>
     "POST",
     {
       ids: [message],
-      sending_account_id: connection,
+      sending_account_id: connection, without_attachments_acknowledged: true,
       authorize_followups: true,
       dry_run: true,
     },
@@ -106,7 +106,7 @@ describe("controlled recipient approval dry run", () => {
         .get(message),
     ).toMatchObject({ status: "draft", approved: 0, live_ready: 0 });
   });
-  it("keeps external safeguards when the recipient is absent from the allowlist", async () => {
+  it("validates external sequences when production mode is explicitly enabled", async () => {
     h.env.LIVE_TEST_RECIPIENTS = "existing@example.invalid";
     h.db
       .prepare(
@@ -115,10 +115,8 @@ describe("controlled recipient approval dry run", () => {
       .run(owner.id, Date.now());
     const before = changes();
     const response = await validate();
-    expect(response.status).toBe(403);
-    expect((await response.json()).error).toContain(
-      "External outreach allows one follow-up",
-    );
+    expect(response.status).toBe(200);
+    expect((await response.json()).would_authorize_followups).toBe(4);
     expect(changes()).toBe(before);
   });
   it("does not bypass opt-outs for a controlled recipient", async () => {

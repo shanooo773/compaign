@@ -1,0 +1,10 @@
+"use client";
+import {useState} from 'react';
+import {Bell,ArrowRight,Mail,AlertTriangle} from 'lucide-react';
+import {campaignForMessage,formatSchedule} from './campaign-model';
+import {EmptyState} from './ui';
+export function NotificationsView({state,onOpen,onRead,busy}:{state:any;onOpen:(id:string)=>void;onRead:()=>void;busy:boolean}) {
+ const [filter,setFilter]=useState('all');const notices=state.notifications || [];
+ const rows=notices.filter((n:any)=>filter==='all'||filter==='unread'&&!n.read||filter==='warnings'&&n.kind==='reply_warning');
+ return <section className="panel notification-inbox"><div className="section-heading"><div><h2>Your inbox</h2><p>{notices.filter((n:any)=>!n.read).length} unread updates</p></div><button className="secondary" disabled={busy||!notices.some((n:any)=>!n.read)} onClick={onRead}>Mark all as read</button></div><div className="view-tabs" aria-label="Notification filters">{['all','unread','warnings'].map(value=><button key={value} aria-pressed={filter===value} onClick={()=>setFilter(value)}>{value[0].toUpperCase()+value.slice(1)}</button>)}</div>{!rows.length?<EmptyState title="You are all caught up." description="Replies and important account updates will appear here."/>:rows.map((n:any)=>{const c=n.entity_id?campaignForMessage(state,n.entity_id):null;const warning=n.kind==='reply_warning';return <article key={n.id} className={'notification-item'+(!n.read?' unread':'')+(warning?' location-warning':'')}><span className="activity-icon">{warning?<AlertTriangle size={19}/>:n.kind==='reply'?<Mail size={19}/>:<Bell size={19}/>}</span><div><div className="notification-title"><strong>{warning?'Reply needs a folder check':n.kind==='reply'?'New professor reply':n.kind.replaceAll('_',' ')}</strong>{!n.read&&<span className="unread-marker">Unread</span>}</div><p>{n.message}</p>{c&&<small>{c.name}</small>}{n.created_at&&<small>{formatSchedule(n.created_at.includes('T')?n.created_at:n.created_at.replace(' ','T')+'Z',state.profile.timezone)}</small>}</div>{c&&<button className="text-link" onClick={()=>onOpen(c.id)}>Open campaign <ArrowRight size={15}/></button>}</article>;})}</section>;
+}

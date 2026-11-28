@@ -1,3 +1,4 @@
+import { pdfFixture } from "./pdf-fixture";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { harness, fileForm } from "./harness";
 import { cleanDocuments, FILE_LIMIT, TOTAL_BYTES } from "../src/storage";
@@ -270,11 +271,7 @@ describe("private KV document API", () => {
         await h.request(
           "/documents",
           "POST",
-          fileForm(
-            "%PDF-1.7\nSynthetic text-only test PDF\n%%EOF",
-            "cv.pdf",
-            "application/pdf",
-          ),
+          fileForm(await pdfFixture(), "cv.pdf", "application/pdf"),
           a.session,
         )
       ).status,

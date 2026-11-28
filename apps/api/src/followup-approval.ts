@@ -2,7 +2,6 @@ import { type Env, HttpError } from "./runtime";
 import { z } from "zod";
 import { liveEnabled, allowedRecipient } from "./automation";
 import { syncReplies } from "./automation";
-import { testRecipients } from "./live-controls";
 export async function approveFollowup(
   env: Env,
   user: string,
@@ -12,7 +11,7 @@ export async function approveFollowup(
   const input = z
     .object({
       confirmed: z.literal(true),
-      days: z.number().int().min(1).max(30),
+      days: z.number().int().min(1).max(60),
       subject: z
         .string()
         .min(1)
@@ -55,14 +54,6 @@ export async function approveFollowup(
       "The proposal changed. Review its exact content again.",
     );
   const snapshot = JSON.parse(row.snapshot);
-  if (
-    !testRecipients(env).includes(snapshot.recipient.toLowerCase()) &&
-    input.days < 3
-  )
-    throw new HttpError(
-      403,
-      "New external outreach follow-ups require at least 3 days.",
-    );
   if (!(await allowedRecipient(env, snapshot.recipient, user)))
     throw new HttpError(403, "Recipient is outside the current sending mode.");
   await syncReplies(env, fetch, user, id);
@@ -93,7 +84,8 @@ export async function approveFollowup(
     ]);
     if (!applied[0].meta.changes)
       throw new HttpError(409, "Follow-up approval was not applied.");
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("Message storage quota reached")) throw error;
     throw new HttpError(
       409,
       "Follow-up is already approved or unavailable. Refresh its status.",

@@ -192,7 +192,7 @@ describe("Excel-to-outbox import", () => {
   });
   it.each([
     { followup_days: "0" },
-    { followup_days: "31" },
+    { followup_days: "61" },
     { followup_days: "3.5" },
     { scheduled_at: "2099-02-30T12:00:00Z" },
     { scheduled_at: "2099-01-01 12:00" },

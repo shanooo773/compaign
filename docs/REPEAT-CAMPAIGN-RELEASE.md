@@ -1,3 +1,5 @@
+> Historical release record. Current limits, templates, timezone handling and safety behavior are documented in [Excel-driven follow-up upgrade](EXCEL-FOLLOWUP-UPGRADE.md).
+
 # Repeat campaigns and campaign-scoped duplicate prevention
 
 October 29, 2026, Asia/Karachi.

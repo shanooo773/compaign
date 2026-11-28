@@ -1,3 +1,12 @@
+import { scheduleWork, backgroundReplies, quotaBlocked, d1QuotaError, backoffQuota } from "./read-quota";
+import { messageCapacity } from "./message-capacity";
+import { MESSAGE_CAPACITY_ERROR } from "../../../shared/message-capacity";
+import {upcomingEmails,approveRevision} from "./message-revisions";
+import { deleteDraft } from "./draft-deletion";
+import { deleteCampaignWorkspace } from "./campaign-deletion";
+import { archiveCampaign, campaignIdleSQL } from "./campaign-archive";
+import { campaignNameSQL, duplicatePreview, renameCampaign, sendingUsage } from "./campaign-management";
+import { cancelCampaign } from "./campaigns";
 import { reimportDeleted } from "./reimport";
 import { workspaceAccess, limitedWorkspaceState } from "./workspace-access";
 import { approveFollowup } from "./followup-approval";
@@ -8,6 +17,7 @@ import { recordAction } from "./records";
 import { approveGmail, retryGmail } from "./live-approval";
 import {
   isLiveOwner,
+  hasOutreachAccess,
   productionEnabled,
   activationEvidence,
   changeProductionMode,
@@ -87,8 +97,8 @@ const messageSchema = z.object({
   sending_account_id: z.string().uuid().nullable().optional(),
   followup: z
     .object({
-      days: z.number().int().min(1).max(30),
-      delay_value: z.number().int().min(1).max(43200).optional(),
+      days: z.number().int().min(1).max(60),
+      delay_value: z.number().int().min(1).max(86400).optional(),
       delay_unit: z.enum(["minutes", "hours", "days"]).optional(),
       subject: z
         .string()
@@ -210,7 +220,12 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (privateSecurity) return privateSecurity;
   const privateAccount = await accountPrivate(req, env, user);
   if (privateAccount) return privateAccount;
+  if (path === "/api/auth/google/start" && method === "POST") {
+    z.object({ confirmed: z.literal(true) }).parse(await req.json());
+    return startOAuth(env, user, req, "gmail", true, true);
+  }
   const limitedWorkspace = await workspaceAccess(req, env, user);
+  if (path === "/api/capacity" && method === "GET") return json(await messageCapacity(env,user,url.searchParams.get("import_id")));
   const followupApproval = path.match(
     /^\/api\/messages\/([^/]+)\/approve-followup$/,
   );
@@ -313,6 +328,29 @@ async function route(req: Request, env: Env): Promise<Response> {
     ]);
     return json({ ok: true });
   }
+  if(path === "/api/campaigns/delete-draft" && method === "POST") return deleteDraft(env,user,await req.json());
+  const upcomingMatch=path.match(/^\/api\/campaigns\/([^/]+)\/upcoming$/);
+  if(upcomingMatch && method === "GET")return Response.json(await upcomingEmails(env,user,upcomingMatch[1]));
+  if(upcomingMatch && method === "POST")return approveRevision(env,user,upcomingMatch[1],await req.json());
+  const deleteCampaignMatch=path.match(/^\/api\/campaigns\/([^/]+)\/delete$/);
+  if(deleteCampaignMatch && method === "POST") return deleteCampaignWorkspace(env,user,deleteCampaignMatch[1],await req.json());
+  const archiveMatch=path.match(/^\/api\/campaigns\/([^/]+)\/(archive|restore)$/);
+  if(archiveMatch && method === "POST") return archiveCampaign(env,user,archiveMatch[1],archiveMatch[2]==='restore');
+  if (path === "/api/campaigns/duplicate-check" && method === "POST") return duplicatePreview(env,user,await req.json());
+  if (path === "/api/sending/usage" && method === "GET") return Response.json(await sendingUsage(env,user));
+  const activityMatch=path.match(/^\/api\/campaigns\/([^/]+)\/activity$/);
+  if(activityMatch && method === "GET") {
+    const campaign=await env.DB.prepare("SELECT id FROM campaign_approvals WHERE id=? AND user_id=?").bind(activityMatch[1],user).first();
+    if(!campaign) throw new HttpError(404,"Campaign not found.");
+    const before=z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).parse(new URL(req.url).searchParams.get("before") || Number.MAX_SAFE_INTEGER);
+    const rows=await env.DB.prepare(`SELECT rowid cursor,id,action,entity_id,created_at FROM audit WHERE user_id=? AND rowid<? AND (entity_id=? OR entity_id IN (SELECT message_id FROM message_authorizations WHERE user_id=? AND campaign_id=?) OR entity_id IN (SELECT child_id FROM followup_steps WHERE root_id IN (SELECT message_id FROM message_authorizations WHERE user_id=? AND campaign_id=?))) ORDER BY rowid DESC LIMIT 101`).bind(user,before,activityMatch[1],user,activityMatch[1],user,activityMatch[1]).all<any>();
+    return Response.json({activity:rows.results.slice(0,100),has_more:rows.results.length>100,next_cursor:rows.results.slice(0,100).at(-1)?.cursor || null});
+  }
+  const renameMatch=path.match(/^\/api\/campaigns\/([^/]+)\/name$/);
+  if(renameMatch && method === "POST") return renameCampaign(env,user,renameMatch[1],await req.json());
+  const cancelCampaignMatch = path.match(/^\/api\/campaigns\/([^/]+)\/cancel$/);
+  if (cancelCampaignMatch && method === "POST")
+    return cancelCampaign(env, user, cancelCampaignMatch[1]);
   const cancelAutomation = path.match(
     /^\/api\/messages\/([^/]+)\/automation\/cancel$/,
   );
@@ -356,12 +394,12 @@ async function route(req: Request, env: Env): Promise<Response> {
           .bind(user)
           .all(),
         env.DB.prepare(
-          "SELECT id,name,size,content_type,expires_at FROM documents WHERE user_id=? AND storage_state='ready' AND (expires_at IS NULL OR expires_at>?)",
+          "SELECT id,name,size,content_type,expires_at,retained_until FROM documents WHERE user_id=? AND storage_state='ready' AND (expires_at IS NULL OR MAX(expires_at,COALESCE(retained_until,0))>?)",
         )
           .bind(user, Date.now())
           .all(),
         env.DB.prepare(
-          "SELECT m.*,CASE WHEN a.message_id IS NOT NULL AND a.generated=0 THEN json_object('days',a.days,'subject',a.subject,'body',a.body) END effective_followup,p.name professor_name,COALESCE(CASE WHEN json_valid(t.snapshot) THEN json_extract(t.snapshot,'$.recipient') END,m.approved_recipient,p.email) professor_email FROM messages m JOIN professors p ON p.id=m.professor_id LEFT JOIN transports t ON t.message_id=m.id LEFT JOIN automation a ON a.message_id=m.id WHERE m.user_id=? ORDER BY m.created_at DESC",
+          "SELECT m.*,r.snapshot revision_snapshot,r.scheduled_at revision_schedule,r.version revision_version,CASE WHEN a.message_id IS NOT NULL AND a.generated=0 THEN json_object('days',a.days,'subject',a.subject,'body',a.body) END effective_followup,p.name professor_name,COALESCE(CASE WHEN json_valid(t.snapshot) THEN json_extract(t.snapshot,'$.recipient') END,m.approved_recipient,p.email) professor_email FROM messages m JOIN professors p ON p.id=m.professor_id LEFT JOIN transports t ON t.message_id=m.id LEFT JOIN automation a ON a.message_id=m.id LEFT JOIN current_message_revisions r ON r.message_id=m.id WHERE m.user_id=? AND NOT EXISTS(SELECT 1 FROM message_authorizations auth JOIN campaign_workspace_deletions d ON d.campaign_id=auth.campaign_id AND d.user_id=auth.user_id WHERE auth.message_id=m.id AND d.state='deleted') ORDER BY m.created_at DESC",
         )
           .bind(user)
           .all(),
@@ -387,8 +425,9 @@ async function route(req: Request, env: Env): Promise<Response> {
       documents: documents.results,
       messages: messages.results.map((m) => ({
         ...m,
+        ...(m.revision_snapshot ? {original_subject:m.subject,original_body:m.body,original_scheduled_at:m.scheduled_at,subject:JSON.parse(m.revision_snapshot as string).subject,body:JSON.parse(m.revision_snapshot as string).body,scheduled_at:m.revision_schedule||m.scheduled_at} : {}),
         followup_proposal: m.followup_proposal || m.effective_followup || null,
-        attachments: attachments.results
+        attachments: m.revision_snapshot ? JSON.parse(m.revision_snapshot as string).attachments.map((d:any)=>d.id) : attachments.results
           .filter((a) => a.message_id === m.id)
           .map((a) => a.document_id),
       })),
@@ -405,7 +444,7 @@ async function route(req: Request, env: Env): Promise<Response> {
         workspace_limited: false,
         gmail: oauthAvailable(env, "gmail"),
         outlook: oauthAvailable(env, "outlook"),
-        live_email: liveEnabled(env) && isLiveOwner(env, user),
+        live_email: liveEnabled(env) && (await hasOutreachAccess(env, user)),
         mock_delivery: env.MOCK_DELIVERY_ENABLED !== "false",
         live_owner: !!env.LIVE_OWNER_USER_IDS?.trim() && isLiveOwner(env, user),
         production_outreach: await productionEnabled(env, user),
@@ -431,7 +470,7 @@ async function route(req: Request, env: Env): Promise<Response> {
       ).first(),
       followup_steps: (
         await env.DB.prepare(
-          "SELECT f.*,m.status root_status,c.status account_status,t.sync_checked_at,last.status sending_status,ct.state transport_state,ct.provider_id,ct.next_at,last.error FROM followup_steps f JOIN messages m ON m.id=f.root_id JOIN transports t ON t.message_id=m.id JOIN connections c ON c.id=t.connection_id LEFT JOIN messages last ON last.id=f.child_id LEFT JOIN transports ct ON ct.message_id=f.child_id WHERE m.user_id=? ORDER BY f.root_id,f.step",
+          "SELECT f.root_id,f.step,f.child_id,COALESCE(json_extract(r.snapshot,'$.subject'),f.subject) subject,COALESCE(json_extract(r.snapshot,'$.body'),f.body) body,f.delay_value,f.delay_unit,f.relative_to,f.authorized_at,COALESCE(CAST(round((julianday(r.scheduled_at)-2440587.5)*86400000) AS INTEGER),f.due_at) due_at,f.next_check_at,f.queued,f.cancel_reason,m.status root_status,c.status account_status,t.sync_checked_at,last.status sending_status,ct.state transport_state,ct.provider_id,ct.next_at,last.error FROM followup_steps f JOIN messages m ON m.id=f.root_id JOIN transports t ON t.message_id=m.id JOIN connections c ON c.id=t.connection_id LEFT JOIN messages last ON last.id=f.child_id LEFT JOIN transports ct ON ct.message_id=f.child_id LEFT JOIN current_message_revisions r ON r.message_id=f.child_id WHERE m.user_id=? ORDER BY f.root_id,f.step",
         )
           .bind(user)
           .all()
@@ -471,9 +510,11 @@ async function route(req: Request, env: Env): Promise<Response> {
           .bind(user)
           .all()
       ).results,
+      sending_usage: await sendingUsage(env,user),
+      reply_locations: (await env.DB.prepare("SELECT * FROM reply_locations WHERE user_id=?").bind(user).all()).results,
       campaigns: (
         await env.DB.prepare(
-          "SELECT id,name,approved_at,initial_count,followup_count,sending_account_id FROM campaign_approvals WHERE user_id=? ORDER BY approved_at DESC",
+          `SELECT c.id,${campaignNameSQL} name,c.approved_at,c.initial_count,c.followup_count,c.sending_account_id,(SELECT archived_at FROM campaign_archives ar WHERE ar.campaign_id=c.id AND ar.user_id=c.user_id) archived_at,(${campaignIdleSQL}) can_archive,EXISTS(SELECT 1 FROM audit WHERE action='campaign.cancelled' AND entity_id=c.id AND user_id=c.user_id) cancelled FROM campaign_approvals c WHERE c.user_id=? AND NOT EXISTS(SELECT 1 FROM campaign_workspace_deletions d WHERE d.campaign_id=c.id AND d.user_id=c.user_id AND d.state='deleted') ORDER BY c.approved_at DESC`,
         )
           .bind(user)
           .all()
@@ -747,10 +788,10 @@ async function route(req: Request, env: Env): Promise<Response> {
         (await digest(JSON.stringify([payloadHash, retired?.n || 0])));
     } else importId = request.import_id;
     const previous = await env.DB.prepare(
-      "SELECT payload_hash FROM campaign_imports WHERE user_id=? AND id=?",
+      "SELECT payload_hash, NOT EXISTS(SELECT 1 FROM messages m WHERE m.user_id=campaign_imports.user_id AND m.campaign_import_id=campaign_imports.id AND m.status!='cancelled' AND NOT EXISTS(SELECT 1 FROM message_authorizations a JOIN campaign_workspace_deletions d ON d.campaign_id=a.campaign_id AND d.user_id=a.user_id WHERE a.message_id=m.id AND d.state='deleted')) can_start_new_import FROM campaign_imports WHERE user_id=? AND id=?",
     )
       .bind(user, importId)
-      .first<{ payload_hash: string }>();
+      .first<{ payload_hash: string; can_start_new_import: number }>();
     if (previous) {
       if (previous.payload_hash !== payloadHash)
         throw new HttpError(
@@ -766,6 +807,7 @@ async function route(req: Request, env: Env): Promise<Response> {
       ).results;
       return json({
         import_id: importId,
+        can_start_new_import: !!previous.can_start_new_import,
         created: 0,
         skipped: rows.length,
         drafts,
@@ -840,11 +882,11 @@ async function route(req: Request, env: Env): Promise<Response> {
           { minutes: 60000, hours: 3600000, days: 86400000 }[
             m.followup.delay_unit
           ] >
-          30 * 86400000)
+          60 * 86400000)
     )
       throw new HttpError(
         400,
-        "Flexible follow-up delays must be positive and no longer than 30 days.",
+        "Flexible follow-up delays must be positive and no longer than 60 days.",
       );
     if (env.MOCK_DELIVERY_ENABLED === "false" && m.mode === "auto")
       throw new HttpError(
@@ -883,16 +925,6 @@ async function route(req: Request, env: Env): Promise<Response> {
       throw new HttpError(
         400,
         "Save a draft and review the entire flexible sequence before approving.",
-      );
-    if (
-      m.followup &&
-      !modernFollowup &&
-      !testRecipients(env).includes(String(recipient.email).toLowerCase()) &&
-      m.followup.days < 3
-    )
-      throw new HttpError(
-        403,
-        "New external outreach follow-ups require at least 3 days.",
       );
     const snapshot = m.sending_account_id
       ? await transportSnapshot(
@@ -1164,7 +1196,11 @@ export default {
             ? 65536
             : path === "/api/professors"
               ? 11 * 1024 * 1024
-              : 131072;
+              : path === "/api/messages/approve" || /^\/api\/campaigns\/[^/]+\/upcoming$/.test(path)
+                ? 11 * 1024 * 1024
+                : path === "/api/imports/drafts"
+                  ? 5 * 1024 * 1024
+                  : 131072;
           const reader = req.body.getReader(),
             chunks: Uint8Array[] = [];
           let total = 0;
@@ -1202,7 +1238,7 @@ export default {
         res = json(
           {
             error:
-              "Message capacity reached (100 per student, 1000 globally). Ask the operator to review private retention; no paid upgrade is performed.",
+              MESSAGE_CAPACITY_ERROR,
           },
           429,
         );
@@ -1249,21 +1285,21 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env) {
     if (!env.DB || !env.DOCUMENTS_KV) return;
+    if (await quotaBlocked(env)) return;
+    try {
     await env.DB.prepare(
       "INSERT INTO scheduler_health(id,started_at,failure) VALUES(1,?,NULL) ON CONFLICT(id) DO UPDATE SET started_at=excluded.started_at,failure=NULL",
     )
       .bind(Date.now())
       .run();
-    try {
-      // Mock scheduling remains minute-based. Rotate heavier work to cap each tick.
+      // Sending and due follow-ups run on every minute tick; stored schedules are untouched.
       await runJobs(env);
-      const phase = Math.floor(Date.now() / 60000) % 3;
-      if (phase === 0) {
-        await syncReplies(env);
-        await queueFollowups(env);
-        await queueSequence(env);
-      } else if (phase === 1) await runLiveJobs(env);
-      else {
+      await queueFollowups(env);
+      await queueSequence(env);
+      await runLiveJobs(env);
+      const work = scheduleWork(_event.scheduledTime || Date.now());
+      await backgroundReplies(env, _event.scheduledTime || Date.now());
+      if (work.maintenance) {
         await checkGmail(env);
         await cleanDocuments(env);
         await cleanDeletedAccounts(env);
@@ -1282,6 +1318,10 @@ export default {
         .bind(Date.now())
         .run();
     } catch (error) {
+      if (d1QuotaError(error)) {
+        await backoffQuota(env);
+        throw error;
+      }
       await env.DB.prepare(
         "UPDATE scheduler_health SET failure='Scheduled execution failed; inspect Worker logs' WHERE id=1",
       ).run();

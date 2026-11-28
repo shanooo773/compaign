@@ -1,5 +1,13 @@
 "use client";
-import { useEffect, useState, type FormEvent } from "react";
+import { confirmMissingDocuments } from "./missing-document-review";
+import { confirmDuplicateReview } from "./duplicate-review";
+import { WorkspaceDashboard } from "./workspace-dashboard";
+import { NotificationsView } from "./notifications-ui";
+import { CreateCampaign } from "./create-campaign";
+import { DeveloperIntroduction } from "./developer-introduction";
+import { PanelLeftClose, PanelLeftOpen, CircleHelp, Moon, Sun, MoreHorizontal } from "lucide-react";
+import { CampaignDirectory } from "./campaign-directory";
+import { useEffect, useState, useRef, type FormEvent } from "react";
 import {
   AuthPanel,
   AccountSettings,
@@ -33,16 +41,32 @@ import {
   X,
   History,
 } from "lucide-react";
+import { SmartImport } from "./smart-import";
 import { ImportWizard } from "./import-wizard";
 import {
   SequenceSteps,
   SchedulerStatus,
   type SequenceStatus,
 } from "./sequence-status";
+import {
+  ActivationPanel,
+  Welcome,
+  LearningCenter,
+  PracticeCampaign,
+  Help,
+} from "./learning-ui";
+import { ProductTour, startProductTour } from "./product-tour";
+import { BookOpen, FlaskConical } from "lucide-react";
 import Papa from "papaparse";
 import readXlsxFile from "read-excel-file";
-import { spreadsheetDraft } from "../../../shared/spreadsheet";
-import type { FollowupStep } from "../../../shared/followup-sequence";
+import {
+  spreadsheetDraft,
+  normalizeSpreadsheetRow,
+} from "../../../shared/spreadsheet";
+import {
+  MAX_SEQUENCE_DAYS,
+  type FollowupStep,
+} from "../../../shared/followup-sequence";
 import { localDate, zonedISO } from "../lib/timezone";
 
 // Production always uses the same-origin Vercel /api rewrite, including downloads.
@@ -74,7 +98,14 @@ type Professor = {
   university: string;
   interests: string;
 };
-type Doc = { id: string; name: string; size: number; expires_at?: number };
+type Doc = {
+  content_type: string;
+  expires_at?: number | null;
+  retained_until?: number | null;
+  id: string;
+  name: string;
+  size: number;
+};
 type Message = {
   id: string;
   professor_id: string;
@@ -90,6 +121,7 @@ type Message = {
   followup_draft?: string | null;
   approved?: number;
   live_ready?: number;
+  campaign_import_id?: string | null;
   parent_id?: string | null;
   scheduled_at: string;
   timezone: string;
@@ -99,14 +131,25 @@ type Message = {
   attachments: string[];
   error: string | null;
 };
-type Audit = { id: string; action: string; created_at: string };
+type Audit = { id: string; action: string; created_at: string; entity_id?: string };
 type State = {
+  sending_usage?: {sent:number;remaining:number;limit:number;next_available_at:number|null;pacing_available_at:number|null;mailboxes:{connection_id:string;address:string;sent:number;remaining:number;next_available_at:number|null}[]};
+  reply_locations?: {message_id:string;location:string}[];
+  campaigns?: {
+    id: string;
+    name: string;
+    initial_count: number;
+    followup_count: number;
+    approved_at: number;
+    cancelled: number;
+  }[];
   followup_steps?: SequenceStatus[];
   scheduler?: {
     started_at: number;
     completed_at: number;
     failure: string | null;
   } | null;
+  authorizations?: { message_id: string; campaign_id: string; kind: string }[];
   profile: Profile;
   professors: Professor[];
   documents: Doc[];
@@ -134,7 +177,7 @@ type State = {
     };
     ai: string;
   };
-  notifications: { id: string; kind: string; message: string; read: number }[];
+  notifications: { id: string; kind: string; message: string; read: number; entity_id?:string }[];
   automation: {
     message_id: string;
     days: number;
@@ -181,15 +224,17 @@ type State = {
   account: { email: string };
 };
 const nav = [
-  ["Overview", LayoutDashboard],
-  ["Professors", Users],
-  ["Outreach", Send],
-  ["Documents", FileText],
-  ["Follow-ups", CalendarClock],
-  ["Academic profile", GraduationCap],
-  ["Settings", Settings],
-  ["Audit history", History],
+  ["Overview", LayoutDashboard, "Dashboard", "primary"],
+  ["Outreach", Send, "Campaigns", "primary"],
+  ["Professors", Users, "Professors", "primary"],
+  ["Documents", FileText, "Documents", "primary"],
+  ["Notifications", Bell, "Notifications", "primary"],
+  ["Getting Started", BookOpen, "Getting started", "secondary"],
+  ["Practice Campaign", FlaskConical, "Practice campaign", "secondary"],
+  ["Settings", Settings, "Settings", "secondary"],
+  ["Help", CircleHelp, "Help", "secondary"],
 ] as const;
+const viewLabel = (view: string) => ({Overview:"Dashboard",Outreach:"Campaigns","Smart Import":"Create campaign","Getting Started":"Getting started","Practice Campaign":"Practice campaign","Follow-ups":"Sending and follow-ups","Academic profile":"Academic profile","Audit history":"Activity history"}[view] || view);
 const proposalCount = (message: Message) =>
   message.followup_proposal
     ? JSON.parse(message.followup_proposal).steps?.length || 1
@@ -205,6 +250,18 @@ const initialProfile = {
   stopped: 0,
 };
 async function request(path: string, method = "GET", data?: unknown) {
+  if(path==="/messages/approve" && method==="POST" && data && !(data as any).dry_run){
+    const preview=await request(path,"POST",{...(data as any),dry_run:true});
+    if(preview.missing_attachments?.length){
+      if(!(await confirmMissingDocuments(preview.missing_attachments,(data as any).ids.length))) throw new Error("Choose documents below, then review and approve again. Your draft has been preserved.");
+      data={...(data as any),without_attachments_acknowledged:true};
+    }
+    const review=preview.duplicate_review;
+    if(review.history.length){
+      if(!(await confirmDuplicateReview(review))) throw new Error("Change Recipients: remove or replace the highlighted duplicate recipients in the editable preview, then review again.");
+      data={...(data as any),duplicate_acknowledgement:review.acknowledgement};
+    }
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);
   try {
@@ -273,6 +330,19 @@ export default function Home() {
     ),
     [review, setReview] = useState<Message | null>(null),
     [selected, setSelected] = useState<string[]>([]);
+  const manualEntry=useRef(false);
+  const [pendingManualEmail,setPendingManualEmail]=useState<string|null>(null),[pendingDraftId,setPendingDraftId]=useState<string|null>(null);
+  useEffect(()=>{if(!pendingManualEmail||!state)return;const saved=state.professors.find(p=>p.email.toLowerCase()===pendingManualEmail);if(saved){setPendingManualEmail(null);compose(saved.id);}},[pendingManualEmail,state]);
+  useEffect(()=>{if(pendingDraftId&&state?.messages.some(m=>m.id===pendingDraftId)){setCampaignFocus('draft:'+pendingDraftId);setCampaignTab('Professors');setView('Outreach');setPendingDraftId(null);}},[pendingDraftId,state]);
+  const [campaignTab,setCampaignTab] = useState("Overview");
+  const [createName,setCreateName] = useState("");
+  const [collapsed,setCollapsed] = useState(false),[narrow,setNarrow] = useState(false);
+  const [settingsSection,setSettingsSection] = useState("connections");
+  const sidebarRef=useRef<HTMLElement>(null),navigationButton=useRef<HTMLButtonElement>(null);
+  useEffect(()=>{const media=window.matchMedia('(max-width:960px)');const update=()=>setNarrow(media.matches);update();media.addEventListener('change',update);try{setCollapsed(localStorage.getItem('professor-agent-sidebar')==='collapsed');}catch{}return()=>media.removeEventListener('change',update);},[]);
+  useEffect(()=>{if(!mobile||!narrow)return;const previous=document.activeElement as HTMLElement;const overflow=document.body.style.overflow;document.body.style.overflow='hidden';const element=sidebarRef.current;const items=()=>Array.from(element?.querySelectorAll<HTMLElement>('button:not(:disabled),a[href]')||[]);items()[0]?.focus();const trap=(event:KeyboardEvent)=>{const list=items();if(event.key==='Escape'){event.preventDefault();setMobile(false);}if(event.key==='Tab'){if(event.shiftKey&&document.activeElement===list[0]){event.preventDefault();list.at(-1)?.focus();}else if(!event.shiftKey&&document.activeElement===list.at(-1)){event.preventDefault();list[0]?.focus();}}};element?.addEventListener('keydown',trap);return()=>{document.body.style.overflow=overflow;element?.removeEventListener('keydown',trap);(navigationButton.current||previous)?.focus();};},[mobile,narrow]);
+  const [campaignFocus,setCampaignFocus] = useState<string|null>(null);
+  const [campaignName,setCampaignName] = useState("Professor outreach campaign");
   const [recordFilter, setRecordFilter] = useState("active");
   const [approvalAccount, setApprovalAccount] = useState("");
   const [authorizeImportedFollowups, setAuthorizeImportedFollowups] =
@@ -289,7 +359,7 @@ export default function Home() {
     } | null>(null);
   const [profile, setProfile] = useState<Profile>(initialProfile);
   const [identity, setIdentity] = useState<Identity | null>(null),
-    [mailReady, setMailReady] = useState(false),
+    [googleReady, setGoogleReady] = useState(false),
     [theme, setTheme] = useState("light"),
     [policy, setPolicy] = useState(""),
     [link, setLink] = useState<{
@@ -308,9 +378,30 @@ export default function Home() {
           history.replaceState(null, "", window.location.pathname);
         }
       }
+      const campaignLink=new URLSearchParams(window.location.search).get("campaign") || fragment.get("campaign");if(campaignLink){setCampaignFocus(campaignLink);setCampaignTab("Overview");setView("Outreach");}
       if (["#terms", "#privacy"].includes(window.location.hash))
         setPolicy(window.location.hash.slice(1));
     };
+    const parameters = new URLSearchParams(window.location.search);
+    const activationError = parameters.get("activation_error");
+    if (activationError) {
+      setError(activationError.slice(0, 900));
+      history.replaceState(
+        null,
+        "",
+        window.location.pathname + window.location.hash,
+      );
+    }
+    if (parameters.get("activation") === "verified") {
+      setNotice(
+        "Account verified and Gmail connected. Review your profile, documents and campaign before approving any outreach.",
+      );
+      history.replaceState(
+        null,
+        "",
+        window.location.pathname + window.location.hash,
+      );
+    }
     readLink();
     window.addEventListener("hashchange", readLink);
     const stored =
@@ -326,6 +417,7 @@ export default function Home() {
     const close = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setMobile(false);
+        manualEntry.current=false;
         setModal(null);
         setReview(null);
         setDocumentPreview(null);
@@ -390,6 +482,7 @@ export default function Home() {
     attachments: [] as string[],
   });
   const [draftWarning, setDraftWarning] = useState("");
+  const [smartPrepared, setSmartPrepared] = useState<any>(null);
   const [importRows, setImportRows] = useState<Record<string, string>[] | null>(
     null,
   );
@@ -441,7 +534,7 @@ export default function Home() {
     try {
       const me = await request("/auth/me");
       setIdentity(me.account);
-      setMailReady(me.mail_delivery_ready);
+      setGoogleReady(me.google_activation_ready === true);
       const data = await request("/state");
       setState(data);
       setProfile(data.profile);
@@ -542,8 +635,11 @@ export default function Home() {
       rows = sheet
         .slice(1)
         .filter((r) => r.some(Boolean))
-        .map((row) =>
-          Object.fromEntries(headers.map((h, i) => [h, String(row[i] ?? "")])),
+        .map((row, index) =>
+          normalizeSpreadsheetRow(
+            Object.fromEntries(headers.map((h, i) => [h, row[i] ?? ""])),
+            index,
+          ),
         );
     } else {
       const parsed = Papa.parse<Record<string, string>>(await file.text(), {
@@ -553,6 +649,16 @@ export default function Home() {
       });
       if (parsed.errors.length)
         throw new Error("Invalid CSV: " + parsed.errors[0].message);
+      if (
+        Object.keys(
+          (parsed.meta as { renamedHeaders?: Record<string, string> })
+            .renamedHeaders || {},
+        ).length ||
+        parsed.meta.fields?.some((header) => !header)
+      )
+        throw new Error(
+          "CSV headers must be nonempty and unique. Use the downloadable template column names.",
+        );
       rows = parsed.data;
     }
     if (!rows.length || rows.length > 500)
@@ -581,6 +687,7 @@ export default function Home() {
         );
         return;
       }
+      setSmartPrepared(null);
       setImportRows(rows);
       return;
     }
@@ -609,7 +716,9 @@ export default function Home() {
       : !r.archived_at && !r.hidden_at);
   const messages = (state?.messages || []).filter(visibleRecord),
     professors = (state?.professors || []).filter(visibleRecord);
-  const filtered = messages.filter(
+  const focusedIds = new Set((state?.authorizations || []).filter(a=>a.campaign_id===campaignFocus).map(a=>a.message_id));
+  const scopedMessages = messages.filter(m=>!campaignFocus || (campaignFocus.startsWith("draft:") ? (m.campaign_import_id || m.id)===campaignFocus.slice(6) && !(state?.authorizations || []).some(a=>a.message_id===m.id) : campaignFocus==="drafts" ? !(state?.authorizations || []).some(a=>a.message_id===m.id) : focusedIds.has(m.id) || !!m.parent_id && focusedIds.has(m.parent_id)));
+  const filtered = scopedMessages.filter(
     (m) =>
       (statusFilter === "all" || m.status === statusFilter) &&
       (m.professor_name + " " + m.subject + " " + m.status)
@@ -711,6 +820,7 @@ export default function Home() {
   const approvalOptions = () =>
     realWorkflow
       ? {
+          name: campaignName,
           sending_account_id: gmailAccount,
           authorize_followups: authorizeImportedFollowups,
         }
@@ -719,6 +829,7 @@ export default function Home() {
     realWorkflow && (
       <fieldset>
         <legend>Approve exact Gmail delivery</legend>
+        <label>Campaign Name<input aria-label="Campaign Name" required maxLength={160} value={campaignName} onChange={e=>setCampaignName(e.target.value)} /></label>
         {state.mailbox_checks
           ?.filter(
             (k) => k.connection_id === gmailAccount && k.status !== "ready",
@@ -887,11 +998,11 @@ export default function Home() {
             <th>
               <span className="sr-only">Select manual drafts</span>
             </th>
-            <th>PROFESSOR / SUBJECT</th>
-            <th>WORKFLOW</th>
-            <th>STATUS</th>
-            <th>SCHEDULE</th>
-            <th>ACTIONS</th>
+            <th>Professor / email</th>
+            <th>Follow-up status</th>
+            <th>Status</th>
+            <th>Schedule</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -921,16 +1032,11 @@ export default function Home() {
                 <button className="text-link" onClick={() => setReview(m)}>
                   {m.professor_name}
                 </button>
-                <small>{m.subject}</small>
+                <small>{m.parent_id ? "Follow-up" : "Initial email"}: {m.subject}</small><small>{m.professor_email}</small><small>{state.professors.find(p=>p.id===m.professor_id)?.university}</small>
               </td>
               <td>
-                <span className="muted">
-                  {m.mode === "manual"
-                    ? "Manual"
-                    : m.mode === "review"
-                      ? "AI · review"
-                      : "AI · authorized"}
-                </span>
+                <span className="muted">{state.followup_steps?.some(f=>f.root_id===m.id&&!f.cancel_reason)?'Conditional follow-ups':m.parent_id?'Follow-up email':m.mode==='manual'?'No active sequence':'Reviewed workflow'}</span>
+
               </td>
               <td>
                 <span className={"badge " + m.status}>
@@ -1071,7 +1177,7 @@ export default function Home() {
     </div>
   );
   return (
-    <div className="app-shell">
+    <div className={"app-shell redesign-shell"+(collapsed?" sidebar-collapsed":"")}>
       <a href="#main-content" className="skip-link">
         Skip to content
       </a>
@@ -1082,101 +1188,18 @@ export default function Home() {
           onClick={() => setMobile(false)}
         />
       )}
-      <aside className={"sidebar " + (mobile ? "open" : "")}>
-        <a className="brand" href="/">
-          {" "}
-          <div className="brand-icon">
-            <GraduationCap size={24} />
-          </div>
-          <div>
-            MS Professor<span>OUTREACH AGENT</span>
-          </div>
-        </a>
-        <div className="workspace-label">
-          RESEARCH WORKSPACE <span>MS</span>
-        </div>
-        <nav>
-          {nav
-            .filter(
-              ([name]) =>
-                !limitedWorkspace ||
-                [
-                  "Overview",
-                  "Professors",
-                  "Documents",
-                  "Academic profile",
-                  "Settings",
-                ].includes(name),
-            )
-            .map(([name, Icon]) => (
-              <button
-                key={name}
-                className={view === name ? "active" : ""}
-                onClick={() => {
-                  setView(name);
-                  setQuery("");
-                  setMobile(false);
-                }}
-              >
-                <Icon size={19} />
-                {name}
-                {name === "Outreach" && counts.pending > 0 && (
-                  <span className="nav-count">{counts.pending}</span>
-                )}
-              </button>
-            ))}
-        </nav>
-        <div className="sidebar-bottom">
-          <div className="mock-card">
-            <span className="dot" /> YOUR PRIVATE WORKSPACE
-            <p>
-              Build connections.
-              <br />
-              Explore possibilities.
-            </p>
-            <small>
-              {state.capabilities.live_email
-                ? state.capabilities.production_outreach
-                  ? "Real Gmail outreach enabled."
-                  : "Real Gmail enabled - controlled testing."
-                : limitedWorkspace
-                  ? "Email Not Verified. Private workspace access only."
-                  : state.capabilities.mock_delivery
-                    ? "Email sending is simulated."
-                    : "Real sending disabled. Drafts cannot send."}{" "}
-              {state.capabilities.ai === "groq"
-                ? "Groq template selection active."
-                : "Editable factual templates active."}
-            </small>
-          </div>
-          <button className="user" onClick={() => setView("Academic profile")}>
-            <span className="avatar">
-              {(profile.name || state.account.email).slice(0, 2).toUpperCase()}
-            </span>
-            <span>
-              {profile.name || "Your workspace"}
-              <small>Student account</small>
-            </span>
-            <ChevronRight size={15} />
-          </button>
-          <button
-            className="logout"
-            onClick={() =>
-              act(async () => {
-                await request("/auth/logout", "POST");
-                setState(null);
-              }, "Signed out")
-            }
-          >
-            <LogOut size={15} /> Sign out
-          </button>
-        </div>
+      <aside id="workspace-navigation" ref={sidebarRef} className={"sidebar "+(mobile?"open":"")} aria-label="Workspace navigation" role={narrow&&mobile?"dialog":undefined} aria-modal={narrow&&mobile?true:undefined} inert={narrow&&!mobile}>
+        <div className="brand-row"><a className="brand" href="/" aria-label="Professor Agent home"><div className="brand-icon"><GraduationCap size={23}/></div><div className="brand-copy">Professor Agent<span>Academic outreach</span></div></a><button className="icon-button drawer-close" aria-label="Close navigation" onClick={()=>setMobile(false)}><X size={20}/></button></div>
+        <nav aria-label="Main navigation">{["primary","secondary"].map(group=><div key={group} className={"nav-group nav-"+group}>{group==='secondary'&&<span className="nav-section-label">Resources</span>}{nav.filter(([name,, ,section])=>section===group&&(!limitedWorkspace||["Overview","Professors","Documents","Getting Started","Practice Campaign","Settings","Help"].includes(name))).map(([name,Icon,label])=><button key={name} data-tour={"nav-"+name} aria-label={label} title={collapsed?label:undefined} aria-current={view===name||name==='Outreach'&&view==='Smart Import'||name==='Settings'&&['Academic profile','Follow-ups','Audit history'].includes(view)?'page':undefined} className={view===name||name==='Outreach'&&view==='Smart Import'||name==='Settings'&&['Academic profile','Follow-ups','Audit history'].includes(view)?'active':''} onClick={()=>{setView(name);if(name==='Outreach'){setCampaignFocus(null);setCampaignTab('Overview');}setQuery('');setMobile(false);}}><Icon size={18}/><span className="nav-label">{label}</span>{name==='Notifications'&&state.notifications.some(n=>!n.read)&&<span className="nav-count">{state.notifications.filter(n=>!n.read).length}</span>}</button>)}</div>)}</nav>
+        <div className="sidebar-bottom"><button className="collapse-navigation" aria-label={collapsed?'Expand sidebar':'Collapse sidebar'} onClick={()=>{const value=!collapsed;setCollapsed(value);try{localStorage.setItem('professor-agent-sidebar',value?'collapsed':'expanded');}catch{}}}>{collapsed?<PanelLeftOpen size={18}/>:<PanelLeftClose size={18}/>}<span>Collapse sidebar</span></button><button className="user" onClick={()=>{setSettingsSection('account');setView('Settings');setMobile(false);}}><span className="avatar">{(profile.name||state.account.email).slice(0,2).toUpperCase()}</span><span className="user-copy">{profile.name||'Your workspace'}<small>Student account</small></span><ChevronRight size={15}/></button><button className="logout" onClick={()=>act(async()=>{await request('/auth/logout','POST');setState(null);},'Signed out')}><LogOut size={16}/><span>Sign out</span></button></div>
       </aside>
       <div className="main-shell">
         <header className="topbar">
           <div className="breadcrumb">
             <button
               className="mobile-toggle"
+              ref={navigationButton}
+              aria-controls="workspace-navigation"
               aria-label="Open navigation"
               aria-expanded={mobile}
               onClick={() => setMobile(!mobile)}
@@ -1184,7 +1207,7 @@ export default function Home() {
               <Menu size={21} />
             </button>
             Workspace <ChevronRight size={13} />
-            <strong>{view}</strong>
+            <strong>{viewLabel(view)}</strong>{view==="Outreach"&&campaignFocus&&<><ChevronRight size={13}/><span className="breadcrumb-campaign">{state.campaigns?.find(c=>c.id===campaignFocus)?.name||"Draft review"}</span></>}
           </div>
           <div className="top-actions">
             <button
@@ -1197,74 +1220,72 @@ export default function Home() {
                 localStorage.setItem("workspace-theme", next);
               }}
             >
-              {theme === "dark" ? "☀ Light" : "☾ Dark"}
+              {theme === "dark" ? <Sun size={17}/> : <Moon size={17}/>}
             </button>
             <span className="sandbox">
               <span className="dot" />
               {state.capabilities.live_email
-                ? "Controlled live tests"
+                ? state.capabilities.production_outreach
+                  ? "Gmail sending enabled"
+                  : "Limited sending access"
                 : state.capabilities.mock_delivery
-                  ? "Mock environment"
-                  : "Real sending disabled"}
+                  ? "Practice sending enabled"
+                  : limitedWorkspace
+                    ? "Verify account to send"
+                    : "Sending unavailable for this workspace"}
             </span>
             <button
               disabled={limitedWorkspace}
-              aria-label="Follow-up notifications"
+              aria-label={"Notifications, "+state.notifications.filter(n=>!n.read).length+" unread"}
               className="notification"
-              onClick={() => setView("Follow-ups")}
+              onClick={() => setView("Notifications")}
             >
-              <Bell size={19} />
-              {followups.length > 0 && <i />}
+              <Bell size={19} /><span>{state.notifications.filter(n=>!n.read).length}</span>
+              
             </button>
             <span className="avatar small">
               {(profile.name || "ST").slice(0, 2).toUpperCase()}
             </span>
           </div>
         </header>
-        <main className="content" id="main-content">
+        <main className="content" id="main-content" tabIndex={-1}>
           {feedback}
-          <div className="page-heading">
-            <div>
-              <div className="eyebrow">YOUR ACADEMIC JOURNEY, ORGANIZED</div>
-              <h1>
-                {view === "Overview"
-                  ? `Welcome back${profile.name ? ", " + (identity?.first_name || profile.name.split(" ")[0]) : ""}.`
-                  : view}
-              </h1>
-              <p>
-                {view === "Overview"
-                  ? "Small steps today. Meaningful research opportunities tomorrow."
-                  : view === "Professors"
-                    ? "Find your research fit and keep every connection in one place."
-                    : view === "Outreach"
-                      ? "Thoughtful messages. Clear approvals. You stay in control."
-                      : view === "Documents"
-                        ? "Your academic story, securely stored and ready to share."
-                        : view === "Follow-ups"
-                          ? "Keep the conversation moving, at the right time."
-                          : view === "Settings"
-                            ? "Manage your workspace and future email connections."
-                            : view === "Audit history"
-                              ? "A transparent record of activity in your student workspace."
-                              : "Help professors understand the researcher behind the email."}
-              </p>
-            </div>
-            {!limitedWorkspace && ["Overview", "Outreach"].includes(view) && (
-              <button className="primary" onClick={() => compose()}>
-                <Plus size={17} /> Compose outreach
-              </button>
-            )}
+          {identity && (
+            <ProductTour
+              key={state.account.email}
+              userKey={state.account.email}
+              limited={limitedWorkspace}
+              view={view}
+              navigate={setView}
+              hasCampaigns={
+                !!state.campaigns?.length || !!state.messages.length
+              }
+            />
+          )}
+          <div className="page-heading"><div><h1>{view==='Overview'?'Welcome back':view==='Outreach'&&campaignFocus?(state.campaigns?.find(c=>c.id===campaignFocus)?.name||'Review draft campaign'):viewLabel(view)}</h1><p>{view==='Overview'?'Manage your professor outreach and stay on top of replies.':view==='Outreach'?campaignFocus?'Your approved conversations, schedule and history.':'Organize each research goal, from first draft to final reply.':view==='Smart Import'?'Build a thoughtful outreach plan, one clear step at a time.':view==='Professors'?'Your academic contacts and research interests, in one place.':view==='Documents'?'Keep your CV and supporting documents ready to share.':view==='Notifications'?'Replies and important updates from your workspace.':view==='Settings'?'Manage your account, connections and sending preferences.':view==='Getting Started'?'Learn the workflow at your own pace.':view==='Practice Campaign'?'Try the complete process with fictional data and no real sending.':view==='Help'?'Find a guide or return to a workflow.':'Review and manage your workspace.'}</p></div>
+            {!limitedWorkspace&&(view==='Overview'||view==='Outreach'&&!campaignFocus)&&<button data-tour="compose" className="primary" onClick={()=>{setCreateName('');setCampaignFocus(null);setView('Smart Import');}}><Plus size={17}/>{view==='Overview'?'Create Campaign':'New Campaign'}</button>}
             {importRows && (
               <ImportWizard
+                key={smartPrepared?.drafts?.[0]?.id || "spreadsheet"}
                 rows={importRows}
+                preparedResult={smartPrepared}
+                initialName={createName || campaignName}
                 api={request}
                 connections={state.connections}
+                documents={state.documents}
                 onRefresh={refresh}
-                onClose={() => setImportRows(null)}
+                onClose={() => {
+                  setImportRows(null);
+                  setSmartPrepared(null);
+                }}
               />
             )}
             {view === "Professors" && (
-              <button className="primary" onClick={() => setModal("professor")}>
+              <button
+                data-tour="add-professor"
+                className="primary"
+                onClick={() => setModal("professor")}
+              >
                 <Plus size={17} /> Add professor
               </button>
             )}
@@ -1286,274 +1307,58 @@ export default function Home() {
               </button>
             </div>
           ) : null}
-          {limitedWorkspace && view === "Overview" && (
-            <section className="panel">
-              <h2>Your private research workspace</h2>
-              <p>
-                Manage your academic profile, research shortlist and private
-                documents.
-              </p>
-              <div className="actions">
-                <button
-                  className="primary"
-                  onClick={() => setView("Academic profile")}
-                >
-                  Edit academic profile
-                </button>
-                <button
-                  className="secondary"
-                  onClick={() => setView("Professors")}
-                >
-                  Manage professors ({professors.length})
-                </button>
-                <button
-                  className="secondary"
-                  onClick={() => setView("Documents")}
-                >
-                  Manage documents ({state.documents.length})
-                </button>
-              </div>
-            </section>
+          {identity&&(view==='Overview'&&limitedWorkspace||view==='Settings'&&settingsSection==='account')&&<ActivationPanel account={identity} ready={googleReady} limited={limitedWorkspace} live={state.capabilities.live_email} production={state.capabilities.production_outreach} gmailConnected={state.connections.some(c=>c.provider==='gmail'&&c.status==='connected')} api={request} refresh={refresh}/>}
+          {view === "Getting Started" && (
+            <LearningCenter
+              userKey={state.account.email}
+              navigate={setView}
+              startTour={startProductTour}
+            />
           )}
-          {!limitedWorkspace && view === "Overview" && (
-            <>
-              <section className="hero">
-                <div>
-                  <span className="hero-label">
-                    <span className="dot" /> A LITTLE MOMENTUM GOES A LONG WAY
-                  </span>
-                  <h2>
-                    Your next chapter
-                    <br />
-                    starts with a connection.
-                  </h2>
-                  <p>
-                    Discover professors, personalize your outreach,
-                    <br />
-                    and make room for what comes next.
-                  </p>
-                  <button onClick={() => setView("Professors")}>
-                    Explore your professors <ArrowUpRight size={17} />
-                  </button>
-                </div>
-                <div className="hero-art" aria-hidden="true">
-                  <div className="orbit orbit-one" />
-                  <div className="orbit orbit-two" />
-                  <div className="art-card paper-back" />
-                  <div className="art-card paper-front">
-                    <div className="art-stamp">
-                      <GraduationCap size={29} />
-                    </div>
-                    <div className="art-line long" />
-                    <div className="art-line" />
-                    <div className="art-line short" />
-                    <div className="art-bottom">
-                      <span />
-                      <Check size={15} />
-                    </div>
-                  </div>
-                  <div className="floating-star">
-                    <Sparkles size={23} />
-                  </div>
-                  <div className="connection-label">
-                    <span className="dot" /> A world of possibilities
-                  </div>
-                </div>
-              </section>
-              <section className="stats">
-                {[
-                  {
-                    label: "Professors saved",
-                    value: professors.length,
-                    icon: Users,
-                    note: "Your research network",
-                  },
-                  {
-                    label: "Emails sent",
-                    value: counts.sent,
-                    icon: Send,
-                    note: state.capabilities.mock_delivery
-                      ? "Simulated deliveries"
-                      : "Confirmed deliveries",
-                  },
-                  {
-                    label: "Replies recorded",
-                    value: counts.replied,
-                    icon: Mail,
-                    note: counts.sent
-                      ? `${Math.round((counts.replied / counts.sent) * 100)}% response rate`
-                      : "Every conversation counts",
-                  },
-                  {
-                    label: "Awaiting action",
-                    value: counts.pending,
-                    icon: Clock,
-                    note: `${counts.failed} failed · Review & scheduled`,
-                  },
-                ].map(({ label, value, icon: Icon, note }) => (
-                  <article className="stat" key={label}>
-                    <div>
-                      {label}
-                      <Icon size={18} />
-                    </div>
-                    <strong>{value.toString().padStart(2, "0")}</strong>
-                    <small>{note}</small>
-                  </article>
-                ))}
-              </section>
-              <section
-                className="stats detail-stats"
-                aria-label="Workspace metrics"
-              >
-                {[
-                  [
-                    "Draft emails",
-                    messages.filter((m) => m.status === "draft").length,
-                  ],
-                  [
-                    "Approved emails",
-                    messages.filter((m) => m.approved).length,
-                  ],
-                  [
-                    "Scheduled emails",
-                    messages.filter((m) => m.status === "pending").length,
-                  ],
-                  ["Failed deliveries", counts.failed],
-                  [
-                    "Follow-ups due",
-                    followups.filter(
-                      (m) => new Date(m.followup_at!) <= new Date(),
-                    ).length,
-                  ],
-                  [
-                    "Connected Gmail",
-                    state.connections.filter(
-                      (c) => c.provider === "gmail" && c.status === "connected",
-                    ).length,
-                  ],
-                  ["AI requests today", state.ai_usage.requests],
-                  ["AI tokens today", state.ai_usage.tokens],
-                ].map(([label, value]) => (
-                  <article className="stat" key={label}>
-                    <div>{label}</div>
-                    <strong>{value}</strong>
-                  </article>
-                ))}
-              </section>
-              <section className="panel activity-panel">
-                <div className="panel-heading">
-                  <h2>Coming up next</h2>
-                  <span className="badge">
-                    {identity?.first_name} {identity?.last_name}
-                  </span>
-                </div>
-                {messages
-                  .filter((m) => m.status === "pending")
-                  .sort((a, b) => a.scheduled_at.localeCompare(b.scheduled_at))
-                  .slice(0, 4)
-                  .map((m) => (
-                    <div className="document-row" key={m.id}>
-                      <CalendarClock size={20} />
-                      <div>
-                        <strong>{m.professor_name}</strong>
-                        <small>{displayDate(m.scheduled_at, m.timezone)}</small>
-                      </div>
-                      <span className="badge pending">Scheduled</span>
-                    </div>
-                  ))}
-                {!messages.some((m) => m.status === "pending") && (
-                  <p className="section-note">
-                    No scheduled actions. Your next conversation can start with
-                    a draft.
-                  </p>
-                )}
-                <div className="panel-heading">
-                  <h3>Recent notifications</h3>
-                </div>
-                {state.notifications.slice(0, 3).map((n) => (
-                  <p className="section-note" key={n.id}>
-                    <strong>{n.kind}: </strong>
-                    {n.message}
-                  </p>
-                ))}
-                {!state.notifications.length && (
-                  <p className="section-note">
-                    All caught up. Account and delivery updates appear here.
-                  </p>
-                )}
-              </section>
-              <div className="overview-grid">
-                <section className="panel">
-                  <div className="panel-heading">
-                    <div>
-                      <h2>Outreach activity</h2>
-                      <p>Your latest conversations at a glance.</p>
-                    </div>
-                    <button
-                      className="text-link"
-                      onClick={() => setView("Outreach")}
-                    >
-                      View all <ArrowUpRight size={15} />
-                    </button>
-                  </div>
-                  {table(messages.slice(0, 5))}
-                </section>
-                <section className="panel journey">
-                  <span className="eyebrow">
-                    MAKE YOUR FIRST IMPRESSION COUNT
-                  </span>
-                  <h2>
-                    A little preparation.
-                    <br />A stronger connection.
-                  </h2>
-                  {[
-                    {
-                      label: "Complete your academic profile",
-                      done: !!profile.name && !!profile.interests,
-                      target: "Academic profile",
-                    },
-                    {
-                      label: "Upload your latest CV",
-                      done: state.documents.length > 0,
-                      target: "Documents",
-                    },
-                    {
-                      label: "Build your professor shortlist",
-                      done: professors.length > 0,
-                      target: "Professors",
-                    },
-                    {
-                      label: "Prepare your first outreach",
-                      done: messages.length > 0,
-                      target: "Outreach",
-                    },
-                  ].map((step, i) => (
-                    <button
-                      className="journey-step"
-                      key={step.label}
-                      onClick={() => setView(step.target)}
-                    >
-                      <span className={step.done ? "done" : ""}>
-                        {step.done ? <Check size={13} /> : i + 1}
-                      </span>
-                      {step.label}
-                      <ChevronRight size={14} />
-                    </button>
-                  ))}
-                  <div className="tip">
-                    <Sparkles size={18} />
-                    <p>
-                      <strong>Make it personal.</strong> A specific research
-                      connection says more than a generic introduction.
-                    </p>
-                  </div>
-                </section>
-              </div>
-            </>
+          {view === "Practice Campaign" && <PracticeCampaign />}
+          {view === "Smart Import" && (
+            <div hidden={!!importRows}><CreateCampaign name={createName} onName={name=>{setCreateName(name);setCampaignName(name);}} onManual={()=>{setCampaignName(createName);manualEntry.current=true;setRecordFilter("active");setEditingProfessor("");setProfessor({name:"",email:"",university:"",interests:""});setModal("professor");}}><SmartImport
+              api={request}
+              userKey={state.account.email}
+              limited={limitedWorkspace}
+              onDraft={(rows, result) => {
+                setSmartPrepared(result);
+                setImportRows(rows);
+                refresh().catch(error=>setError(error.message));
+                setNotice(
+                  "Unapproved drafts created. Review messages, schedules and attachments; approval is a separate action.",
+                );
+                window.scrollTo({ top: 0, behavior: "instant" });
+              }}
+            /></CreateCampaign></div>
           )}
+          {["Professors", "Outreach", "Documents", "Follow-ups"].includes(
+            view,
+          ) && (
+            <Help
+              text={
+                view === "Professors"
+                  ? "CSV headers must include name and email, not professor_name. Download the exact template and read Getting Started lesson 7 before importing."
+                  : view === "Outreach"
+                    ? "Review all recipients, initial messages, follow-ups, attachments and UTC dates before one approval. Import alone does not authorise sending. Read lesson 11 for the full review checklist."
+                    : view === "Documents"
+                      ? "Select the CV for initial messages during campaign review. Follow-up attachments are separate choices. Files expire; review availability before approval."
+                      : "Replies detected in tracked Gmail threads stop eligible remaining follow-ups. Safety checks may delay steps. Never trigger a production send just to test scheduling."
+              }
+            />
+          )}
+          {view==='Overview'&&<WorkspaceDashboard state={state} onCreate={()=>{setCreateName('');setCampaignFocus(null);setView('Smart Import');}} navigate={setView} onOpen={id=>{setCampaignFocus(id);setCampaignTab('Overview');setView('Outreach');}}/>}
+          {view==='Notifications'&&<NotificationsView state={state} busy={busy} onRead={()=>act(async()=>{await request('/notifications/read','POST');},'Notifications marked read')} onOpen={id=>{setCampaignFocus(id);setCampaignTab('Replies');setView('Outreach');}}/>}
+          {view==='Help'&&<section className="panel help-workspace"><h2>How can we help?</h2><p>Find answers in the existing guides, or practise without sending email.</p><div className="help-links"><button className="secondary" onClick={()=>setView('Getting Started')}><BookOpen size={18}/>Read the guides</button><button className="secondary" onClick={()=>setView('Practice Campaign')}><FlaskConical size={18}/>Try a practice campaign</button><button className="secondary" onClick={()=>startProductTour('Overview')}>Take the product tour</button><button className="secondary" onClick={()=>{setSettingsSection('connections');setView('Settings');}}>Connection and sending help</button></div><details><summary>Privacy and terms</summary><button className="text-link" onClick={()=>setPolicy('privacy')}>Privacy policy</button><button className="text-link" onClick={()=>setPolicy('terms')}>Terms of use</button></details></section>}
           {view === "Professors" && (
             <>
               <div className="toolbar">
+                <button
+                  className="secondary"
+                  onClick={() => setView("Smart Import")}
+                >
+                  Create a campaign from contacts
+                </button>
                 <div className="search">
                   <Search size={17} />
                   <input
@@ -1581,6 +1386,7 @@ export default function Home() {
                 <label className="secondary upload-label">
                   <Upload size={16} /> Import CSV / Excel
                   <input
+                    data-tour="file-upload"
                     type="file"
                     accept=".csv,.xlsx"
                     onChange={(e) => {
@@ -1591,6 +1397,7 @@ export default function Home() {
                   />
                 </label>
               </div>
+              <details className="professor-templates"><summary>Templates and import requirements</summary>
               <p className="helper">
                 <a href="/professors-email-template.xlsx" download>
                   Download Excel template
@@ -1607,6 +1414,7 @@ export default function Home() {
                   Download CSV template
                 </a>
               </p>
+              </details>
               <div className="professor-grid">
                 {professors
                   .filter((p) =>
@@ -1615,8 +1423,13 @@ export default function Home() {
                       .includes(query.toLowerCase()),
                   )
                   .map((p) => (
-                    <article className="panel professor-card" key={p.id}>
-                      <button
+                    <article className="professor-row" key={p.id}><span className="professor-avatar">{p.name.split(" ").map(x=>x[0]).slice(0,2).join("")}</span><div className="professor-identity"><h2>{p.name}</h2><small>{p.email}</small><p>{p.university || "University not specified"}</p></div><span className="research-tag">{p.interests || "Research interests not added"}</span><button
+                        className="secondary"
+                        disabled={limitedWorkspace || !!p.archived_at}
+                        onClick={() => compose(p.id)}
+                      >
+                        Prepare outreach <ArrowUpRight size={16} />
+                      </button><details className="context-menu professor-actions"><summary aria-label={"Contact actions for "+p.name}>Actions <MoreHorizontal size={16}/></summary><div className="context-menu-content" onClickCapture={event=>{if((event.target as HTMLElement).closest('button'))event.currentTarget.parentElement?.removeAttribute('open');event.currentTarget.parentElement?.querySelector('summary')?.focus();}}><button
                         className="text-link edit-professor"
                         onClick={() => {
                           setProfessor({
@@ -1630,9 +1443,18 @@ export default function Home() {
                         }}
                       >
                         Edit details
-                      </button>
-                      <div className="actions record-actions">
-                        <button
+                      </button><button
+                        className="secondary"
+                        disabled={busy}
+                        onClick={() => {
+                          setVerificationTarget(p);
+                          setModal("verify");
+                        }}
+                      >
+                        {p.verified_at
+                          ? "Review source confirmation"
+                          : "Confirm source for AI"}
+                      </button><button
                           className="secondary"
                           disabled={busy}
                           onClick={() =>
@@ -1651,8 +1473,7 @@ export default function Home() {
                           }
                         >
                           {p.archived_at ? "Restore" : "Archive"}
-                        </button>
-                        <button
+                        </button><button
                           className="danger"
                           disabled={busy}
                           onClick={() => {
@@ -1672,41 +1493,7 @@ export default function Home() {
                           }}
                         >
                           Delete
-                        </button>
-                      </div>
-                      <span className="professor-avatar">
-                        {p.name
-                          .split(" ")
-                          .map((x) => x[0])
-                          .slice(0, 2)
-                          .join("")}
-                      </span>
-                      <h2>{p.name}</h2>
-                      <p>{p.university || "University not specified"}</p>
-                      <span className="research-tag">
-                        {p.interests || "Research interests to explore"}
-                      </span>
-                      <small>{p.email}</small>
-                      <button
-                        className="secondary"
-                        disabled={limitedWorkspace || !!p.archived_at}
-                        onClick={() => compose(p.id)}
-                      >
-                        Prepare outreach <ArrowUpRight size={16} />
-                      </button>
-                      <button
-                        className="secondary"
-                        disabled={busy}
-                        onClick={() => {
-                          setVerificationTarget(p);
-                          setModal("verify");
-                        }}
-                      >
-                        {p.verified_at
-                          ? "Review source confirmation"
-                          : "Confirm source for AI"}
-                      </button>
-                    </article>
+                        </button></div></details></article>
                   ))}
               </div>
               {!professors.length && (
@@ -1724,7 +1511,8 @@ export default function Home() {
               )}
             </>
           )}
-          {view === "Outreach" && (
+          {view === "Outreach" && <CampaignDirectory api={request} onSaved={refresh} removeDraft={async(ids,name)=>{await request("/campaigns/delete-draft","POST",{ids,confirm_name:name});await refresh();}} tab={campaignTab} onTabChange={setCampaignTab} remove={async(id,name)=>{for(let batch=0;batch<20;batch++){const result=await request(`/campaigns/${id}/delete`,"POST",{confirm_name:name});if(result.done){await refresh();return;}}throw new Error("Deletion is still in progress. Reopen the campaign and retry to continue safely.");}} archive={async(id,restore)=>{await request(`/campaigns/${id}/${restore?"restore":"archive"}`,"POST",{});await refresh();}} state={state} focus={campaignFocus} onOpen={id=>{setCampaignFocus(id);setCampaignTab(id?.startsWith("draft:")||id==="drafts"?"Professors":"Overview");setQuery("");setSelected([]);}} activity={(id,before)=>request(`/campaigns/${id}/activity${before?`?before=${before}`:""}`)} openControls={()=>setView("Follow-ups")} rename={async(id,name)=>{await request(`/campaigns/${id}/name`,"POST",{name});await refresh();}} />}
+          {view === "Outreach" && campaignFocus && (campaignTab==="Professors" || campaignFocus.startsWith("draft:") || campaignFocus==="drafts") && (
             <section className="panel">
               <label>
                 Show records
@@ -1746,10 +1534,10 @@ export default function Home() {
                   type="checkbox"
                   aria-label="Select all campaign drafts"
                   checked={
-                    messages.some(
+                    scopedMessages.some(
                       (m) => m.mode === "manual" && m.status === "draft",
                     ) &&
-                    messages
+                    scopedMessages
                       .filter(
                         (m) => m.mode === "manual" && m.status === "draft",
                       )
@@ -1758,7 +1546,7 @@ export default function Home() {
                   onChange={(e) =>
                     setSelected(
                       e.target.checked
-                        ? messages
+                        ? scopedMessages
                             .filter(
                               (m) =>
                                 m.mode === "manual" &&
@@ -1848,7 +1636,7 @@ export default function Home() {
               </div>
               {selected.length > 0 &&
                 approvalControls(
-                  messages.filter((m) => selected.includes(m.id)),
+                  scopedMessages.filter((m) => selected.includes(m.id)),
                 )}
               {table(filtered)}
               <div className="panel-footer">
@@ -1892,7 +1680,8 @@ export default function Home() {
                 </label>
                 <small>
                   PDF, DOCX, TXT · Maximum 2 MiB per file; 10 files / 20 MiB per
-                  student; files expire after 30 days
+                  student; unretained files expire after 30 days. Approved
+                  campaign attachments stay available for their active plan
                 </small>
               </div>
               {uploadProgress !== null && (
@@ -2000,6 +1789,7 @@ export default function Home() {
           )}
           {view === "Academic profile" && (
             <form
+              data-tour="profile-form"
               className="panel profile-form"
               onSubmit={(e) => {
                 e.preventDefault();
@@ -2028,6 +1818,7 @@ export default function Home() {
                         }[key]
                       }
                       <input
+                        data-tour={"profile-" + key}
                         value={profile[key]}
                         onChange={(e) =>
                           setProfile({ ...profile, [key]: e.target.value })
@@ -2087,7 +1878,63 @@ export default function Home() {
                   {followups.length} reminders
                 </span>
               </div>
-              <SchedulerStatus scheduler={state.scheduler} />
+              <details className="advanced-details"><summary>Advanced sending diagnostics</summary><SchedulerStatus scheduler={state.scheduler} /></details>
+              {(state.campaigns || []).map((campaign) => (
+                <div className="document-row" key={campaign.id}>
+                  <div>
+                    <strong>{campaign.name}</strong>
+                    <p>
+                      {campaign.initial_count} initial emails and{" "}
+                      {campaign.followup_count} approved follow-ups
+                      {campaign.cancelled ? " - cancelled" : ""}
+                    </p>
+                  </div>
+                  <div className="campaign-progress">
+                    <progress
+                      aria-label={`Delivery progress for ${campaign.name}`}
+                      max={campaign.initial_count + campaign.followup_count}
+                      value={
+                        (state.authorizations || []).filter(
+                          (auth) =>
+                            auth.campaign_id === campaign.id &&
+                            state.messages.some(
+                              (message) =>
+                                message.id === auth.message_id &&
+                                ["sent", "replied"].includes(message.status),
+                            ),
+                        ).length
+                      }
+                    />
+                    <small>
+                      {campaign.cancelled
+                        ? "Campaign cancelled"
+                        : "Confirmed delivery progress"}{" "}
+                      � {campaign.initial_count + campaign.followup_count}{" "}
+                      authorized messages
+                    </small>
+                  </div>
+                  <button
+                    className="secondary"
+                    disabled={busy || !!campaign.cancelled}
+                    onClick={() => {
+                      if (
+                        confirm(
+                          "Cancel all future messages and follow-ups in this campaign? Delivered email cannot be recalled.",
+                        )
+                      )
+                        act(async () => {
+                          await request(
+                            `/campaigns/${campaign.id}/cancel`,
+                            "POST",
+                            {},
+                          );
+                        }, "Campaign cancelled");
+                    }}
+                  >
+                    Cancel entire campaign
+                  </button>
+                </div>
+              ))}
               <SequenceSteps
                 steps={state.followup_steps || []}
                 busy={busy}
@@ -2282,9 +2129,10 @@ export default function Home() {
             </section>
           )}
           {view === "Settings" && (
-            <div className="settings-grid">
+            <div className={"settings-workspace settings-show-"+settingsSection}><div className="settings-navigation" aria-label="Settings sections">{[['account','Account and security'],['connections','Email connections'],['usage','Usage'],['about','About']].map(([key,label])=><button key={key} aria-pressed={settingsSection===key} onClick={()=>setSettingsSection(key)}>{label}</button>)}<button data-tour="nav-Academic profile" onClick={()=>setView('Academic profile')}>Academic profile</button><button data-tour="nav-Follow-ups" onClick={()=>setView('Follow-ups')}>Sending and follow-ups</button><button data-tour="nav-Audit history" onClick={()=>setView('Audit history')}>Activity history</button></div><div className="settings-grid">
               {identity && (
                 <AccountSettings
+                  ready={googleReady}
                   account={identity}
                   api={request}
                   refresh={refresh}
@@ -2292,7 +2140,7 @@ export default function Home() {
               )}
               {!limitedWorkspace && (
                 <>
-                  <section className="panel settings-card">
+                  <section className="panel settings-card email-settings">
                     <h2>Email connections</h2>
                     <p>
                       Gmail delivers only approved messages. Reply access lets
@@ -2308,6 +2156,7 @@ export default function Home() {
                         </strong>
                         <button
                           className="secondary"
+                          data-tour={"connect-" + provider}
                           disabled={busy || !state.capabilities[provider]}
                           onClick={() =>
                             act(async () => {
@@ -2363,6 +2212,7 @@ export default function Home() {
                         </button>
                       </div>
                     ))}
+                    <details className="connection-advanced"><summary>Advanced sending access and preparation</summary>
                     {realWorkflow && (
                       <div>
                         <h3>
@@ -2440,6 +2290,7 @@ export default function Home() {
                       student-entered profile and professor fields are used.
                       Always preview and edit before approval.
                     </p>
+                    </details>
                     <button
                       className="secondary"
                       disabled={
@@ -2472,27 +2323,7 @@ export default function Home() {
                         Verify Gmail connection
                       </button>
                     )}
-                    <h3>Notifications</h3>
-                    {state.notifications.map((item) => (
-                      <p key={item.id}>
-                        <strong>{item.kind}: </strong>
-                        {item.message}
-                      </p>
-                    ))}
-                    {!state.notifications.length && (
-                      <p>No account or delivery notifications.</p>
-                    )}
-                    <button
-                      className="secondary"
-                      disabled={busy}
-                      onClick={() =>
-                        act(async () => {
-                          await request("/notifications/read", "POST");
-                        }, "Notifications marked read")
-                      }
-                    >
-                      Mark read
-                    </button>
+                    <button className="text-link" onClick={()=>setView('Notifications')}>Open notification inbox <ArrowUpRight size={15}/></button>
                     <h3>Recipient opt-out</h3>
                     <form
                       onSubmit={(e) => {
@@ -2510,6 +2341,7 @@ export default function Home() {
                       <input
                         type="email"
                         name="address"
+                        aria-label="Recipient email address to block"
                         required
                         placeholder="Recipient who declined or opted out"
                       />
@@ -2518,7 +2350,7 @@ export default function Home() {
                       </button>
                     </form>
                   </section>
-                  <section className="panel settings-card">
+                  <section className="panel settings-card outreach-settings">
                     <h2>Outreach controls</h2>
                     <p>
                       Controls apply to your student account and are checked by
@@ -2580,7 +2412,9 @@ export default function Home() {
                   </section>
                 </>
               )}
-            </div>
+              <section className="panel settings-card usage-settings"><h2>Usage and limits</h2><p>Initial emails and follow-ups share a rolling 24-hour allowance. A one-minute minimum interval applies between sends.</p><div className="usage-summary"><strong>{state.sending_usage?.sent||0} / 50 submitted</strong><span>{state.sending_usage?.remaining??50} remaining</span></div>{state.sending_usage?.remaining===0&&state.sending_usage.next_available_at&&<p>Next allowance: {new Date(state.sending_usage.next_available_at).toLocaleString()}</p>}<details><summary>Advanced usage and diagnostics</summary><p>AI requests today: {state.ai_usage.requests}. AI tokens today: {state.ai_usage.tokens}.</p><SchedulerStatus scheduler={state.scheduler}/></details></section>
+              <section className="panel settings-card about-settings"><h2>About Professor Agent</h2><p>A student workspace for thoughtful academic outreach. You review and approve every sending plan.</p><details><summary>Developer credit</summary><DeveloperIntroduction/></details><button className="text-link" onClick={()=>setPolicy('privacy')}>Privacy policy</button><button className="text-link" onClick={()=>setPolicy('terms')}>Terms of use</button></section>
+            </div></div>
           )}
           {view === "Audit history" && (
             <section className="panel">
@@ -2611,21 +2445,25 @@ export default function Home() {
               ))}
             </section>
           )}
-          {limitedWorkspace && (
-            <section className="panel" role="status">
-              <strong>Email Not Verified</strong>
-              <p>
-                You can manage your academic profile, professors and private
-                documents. Email connections, outreach and campaign approvals
-                require verified access.
-              </p>
-              <p>
-                {mailReady
-                  ? "Verification email delivery is currently unavailable. Your private workspace remains accessible; mailbox actions remain restricted."
-                  : "Verification emails are currently unavailable. Your private workspace remains accessible."}
-              </p>
-            </section>
-          )}
+          {limitedWorkspace &&
+            view !== "Overview" &&
+            view !== "Practice Campaign" &&
+            view !== "Getting Started" &&
+            view !== "Smart Import" && (
+              <section className="panel verification-reminder" role="status">
+                <strong>Email Not Verified</strong>
+                <p>
+                  You can manage your academic profile, professors and private
+                  documents. Email connections, outreach and campaign approvals
+                  require verified access.
+                </p>
+                <p>
+                  {googleReady
+                    ? "Use Verify with Google & Connect Gmail on Overview. Choose the Google account matching your registered email."
+                    : "Google OAuth activation is not configured. Your private workspace remains accessible; verification remains required."}
+                </p>
+              </section>
+            )}
           <footer className="main-footer">
             <span>Made for your next academic chapter.</span>
             <span>
@@ -2636,6 +2474,7 @@ export default function Home() {
       </div>
       <datalist id="timezones">
         {[
+          "Asia/Seoul",
           "Asia/Karachi",
           "Asia/Kolkata",
           "Asia/Dhaka",
@@ -2697,6 +2536,7 @@ export default function Home() {
               <button
                 aria-label="Close dialog"
                 onClick={() => {
+                  manualEntry.current=false;
                   setModal(null);
                   setReview(null);
                   setEditingProfessor("");
@@ -2765,6 +2605,7 @@ export default function Home() {
                       editingProfessor ? "PUT" : "POST",
                       editingProfessor ? professor : [professor],
                     );
+                    if(manualEntry.current){manualEntry.current=false;setPendingManualEmail(professor.email.trim().toLowerCase());}
                     setEditingProfessor("");
                     setProfessor({
                       name: "",
@@ -2805,7 +2646,7 @@ export default function Home() {
                   e.preventDefault();
                   act(
                     async () => {
-                      await request("/messages", "POST", {
+                      const savedDraft=await request("/messages", "POST", {
                         ...draft,
                         sending_account_id: draft.sending_account_id || null,
                         mode:
@@ -2830,6 +2671,7 @@ export default function Home() {
                           draft.timezone,
                         ),
                       });
+                      if(view==="Smart Import"&&draft.mode!=="auto")setPendingDraftId(savedDraft.id);
                       setModal(null);
                     },
                     draft.mode === "auto"
@@ -2877,6 +2719,7 @@ export default function Home() {
                 <label>
                   Professor
                   <select
+                    aria-label="Professor"
                     required
                     value={draft.professor_id}
                     onChange={(e) =>
@@ -3061,10 +2904,10 @@ export default function Home() {
                             min={1}
                             max={
                               followupUnit === "minutes"
-                                ? 43200
+                                ? MAX_SEQUENCE_DAYS * 1440
                                 : followupUnit === "hours"
-                                  ? 720
-                                  : 30
+                                  ? MAX_SEQUENCE_DAYS * 24
+                                  : MAX_SEQUENCE_DAYS
                             }
                             value={draft.followup_days}
                             onChange={(e) =>
@@ -3194,7 +3037,7 @@ export default function Home() {
                     />
                   </label>
                   <label>
-                    IANA timezone
+                    Scheduled email timezone
                     <input
                       required
                       list="timezones"

@@ -94,6 +94,7 @@ const { chromium } = require(
           ".svg": "image/svg+xml",
           ".png": "image/png",
           ".ico": "image/x-icon",
+          ".jpeg": "image/jpeg",
         }[ext] || "application/octet-stream",
       );
       res.end(fs.readFileSync(target));
@@ -117,6 +118,49 @@ const { chromium } = require(
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.goto(base, { waitUntil: "networkidle" });
+    await page
+      .getByRole("heading", { name: "MS Professor Agent", exact: true })
+      .waitFor();
+    assert(
+      await page
+        .locator('img[src="/developer-photo.jpeg"]')
+        .evaluate((img) => img.complete && img.naturalWidth > 0),
+    );
+    for (const text of [
+      "Developed by Muhammad Farhat Mehdi",
+      "Department of Computer Engineering",
+      "Session 2023",
+      "University of Engineering and Technology (UET), Taxila, Pakistan",
+    ])
+      assert(await page.getByText(text, { exact: true }).isVisible());
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    assert.equal(
+      await page
+        .locator(".portrait-orbit")
+        .evaluate((el) => getComputedStyle(el).animationName),
+      "none",
+    );
+    await page.getByRole("button", { name: /Skip introduction/ }).click();
+    assert.equal(
+      await page.evaluate(() => document.activeElement?.id),
+      "account-access",
+    );
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await page.screenshot({
+      path: "apps/api/.wrangler/complete-landing-desktop.png",
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    );
+    await page.screenshot({
+      path: "apps/api/.wrangler/complete-landing-mobile.png",
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 1440, height: 1000 });
     await page
       .getByRole("button", { name: "Create account", exact: true })
       .click();
@@ -148,12 +192,12 @@ const { chromium } = require(
     await page.getByRole("button", { name: "Sign in with password" }).click();
     await page
       .getByRole("heading", {
-        name: "Your private research workspace",
+        name: "Verify your email to unlock mailbox actions",
         exact: true,
       })
       .waitFor();
     assert(
-      await page.getByText("Email Not Verified", { exact: true }).isVisible(),
+      await page.getByRole("button", { name: "Verification email unavailable", exact: true }).isDisabled(),
     );
     // This is an isolated in-memory fixture, never a public application bypass.
     const owner = h.db
@@ -216,7 +260,7 @@ const { chromium } = require(
       .click();
     await page
       .getByRole("button", {
-        name: "APPROVE & SCHEDULE COMPLETE CAMPAIGN",
+        name: "Approve Complete Campaign",
         exact: true,
       })
       .click();
@@ -280,7 +324,7 @@ const { chromium } = require(
       .click();
     await page
       .getByRole("button", {
-        name: "APPROVE & SCHEDULE COMPLETE CAMPAIGN",
+        name: "Approve Complete Campaign",
         exact: true,
       })
       .click();
@@ -373,6 +417,135 @@ const { chromium } = require(
       /MS research inquiry/,
     );
     assert.equal(h.db.prepare("SELECT count(*) n FROM deliveries").get().n, 0);
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await page.getByRole("button", { name: "Documents", exact: true }).click();
+    await page.locator('input[accept=".pdf,.docx,.txt"]').setInputFiles({
+      name: "review-cv.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("Synthetic browser CV attachment"),
+    });
+    await page.getByText("review-cv.txt", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Professors", exact: true }).click();
+    const fields = [
+      "subject",
+      "body",
+      "delay_value",
+      "delay_unit",
+      "relative_to",
+    ];
+    const columns = [
+      "name",
+      "email",
+      "subject",
+      "body",
+      "scheduled_at",
+      "timezone",
+      ...Array.from({ length: 10 }, (_, n) =>
+        fields.map((key) => `follow_up_${n + 1}_${key}`),
+      ).flat(),
+    ];
+    const values = [
+      "Synthetic Ten-step Professor",
+      "controlled@example.com",
+      "Ten-step initial",
+      "Exact initial text",
+      "2099-01-01T12:00:00Z",
+      "Asia/Seoul",
+      ...Array.from({ length: 10 }, (_, n) => [
+        "Step " + (n + 1),
+        "Exact body " + (n + 1),
+        "6",
+        "days",
+        "previous",
+      ]).flat(),
+    ];
+    await page.locator('input[accept=".csv,.xlsx"]').setInputFiles({
+      name: "ten-step.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from(columns.join(",") + "\n" + values.join(",")),
+    });
+    await page
+      .getByRole("button", { name: /Manual \/ Use Excel content/ })
+      .click();
+    await page
+      .getByRole("button", { name: "Review entire campaign once", exact: true })
+      .click();
+    await page.getByText(/Conditional follow-up 10: Step 10/).waitFor();
+    await page
+      .getByRole("checkbox", {
+        name: "Attach review-cv.txt to initial emails",
+        exact: true,
+      })
+      .check();
+    await page
+      .getByText("Optional: attach documents to selected follow-ups", {
+        exact: true,
+      })
+      .click();
+    await page
+      .getByRole("checkbox", {
+        name: "Attach review-cv.txt to follow-up 10",
+        exact: true,
+      })
+      .check();
+    assert.equal(
+      await page
+        .getByRole("checkbox", {
+          name: "Attach review-cv.txt to follow-up 1",
+          exact: true,
+        })
+        .isChecked(),
+      false,
+    );
+    assert.equal(await page.getByText(/Planned earliest UTC:/).count(), 10);
+    await page
+      .getByRole("button", {
+        name: "Approve Complete Campaign",
+        exact: true,
+      })
+      .click();
+    await page
+      .getByRole("heading", {
+        name: "Campaign approved & scheduled",
+        exact: true,
+      })
+      .waitFor();
+    assert.equal(
+      h.db.prepare("SELECT count(*) n FROM followup_steps").get().n,
+      10,
+    );
+    assert.equal(
+      h.db.prepare("SELECT count(*) n FROM campaign_attachment_pins").get().n,
+      1,
+    );
+    const attachmentAuth = JSON.parse(
+      h.db
+        .prepare(
+          "SELECT snapshot FROM message_authorizations ORDER BY rowid DESC LIMIT 1",
+        )
+        .get().snapshot,
+    );
+    assert.equal(attachmentAuth.attachment_plan.initial.length, 1);
+    assert.equal(attachmentAuth.attachment_plan.followups["10"].length, 1);
+    assert.equal(h.db.prepare("SELECT count(*) n FROM deliveries").get().n, 0);
+    await page
+      .getByRole("button", { name: "Cancel future messages", exact: true })
+      .click();
+    await page
+      .getByText(
+        "Future messages cancelled. Previously delivered mail is retained.",
+        { exact: true },
+      )
+      .waitFor();
+    assert.equal(
+      h.db
+        .prepare(
+          "SELECT count(*) n FROM followup_steps WHERE cancel_reason='campaign_cancelled'",
+        )
+        .get().n,
+      10,
+    );
+
     await page.setViewportSize({ width: 390, height: 844 });
     await page.waitForTimeout(500);
     await page.screenshot({
@@ -385,9 +558,41 @@ const { chromium } = require(
       ),
       "Mobile viewport overflow",
     );
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await page.getByRole("button", { name: "Overview", exact: true }).click();
+    await page
+      .getByRole("heading", { name: "Welcome back, Amira.", exact: true })
+      .waitFor();
+    assert.equal(
+      await page.locator('img[src="/developer-photo.jpeg"]').count(),
+      0,
+    );
+    await page.locator(".theme-toggle").click();
+    assert.equal(await page.locator("html").getAttribute("data-theme"), "dark");
+    await page.screenshot({
+      path: "apps/api/.wrangler/complete-dashboard-dark.png",
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+      "Mobile dashboard overflow",
+    );
+    await page.waitForFunction(
+      () =>
+        document.querySelector(".sidebar").getBoundingClientRect().right <= 1,
+    );
+    await page.screenshot({
+      path: "apps/api/.wrangler/complete-dashboard-mobile.png",
+      fullPage: true,
+    });
+
     assert.equal(errors.length, 0, "Browser runtime errors");
     console.log(
-      "PASS browser: actual XLSX upload, Manual, complete review and one approval, cancellation then fresh identical workbook campaign with retained history, individual review, AI safe fallback, mobile layout and no real delivery.",
+      "PASS browser: actual XLSX upload, Manual, complete review and one approval, cancellation then fresh identical workbook campaign with retained history, individual review, AI safe fallback, real developer portrait/introduction/skip/reduced motion, private document upload and initial/explicit-follow-up attachment selection, 60-day ten-step complete review/one approval/atomic cancellation, mobile layout and no real delivery.",
     );
   } finally {
     await browser.close();

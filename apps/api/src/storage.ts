@@ -1,10 +1,12 @@
+import { MAX_SEQUENCE_DAYS } from "../../../shared/followup-sequence";
 import { type Env, HttpError, hash, consume } from "./runtime";
+import { validatePdf } from "./pdf-validation";
 export const FILE_LIMIT = 2 * 1024 * 1024;
 export const USER_BYTES = 20 * 1024 * 1024;
 export const TOTAL_BYTES = 100 * 1024 * 1024;
 export const DOCUMENT_TTL = 30 * 86400;
 export interface DocumentStore {
-  put(key: string, bytes: ArrayBuffer): Promise<void>;
+  put(key: string, bytes: ArrayBuffer, ttl?: number): Promise<void>;
   get(key: string): Promise<ArrayBuffer | null>;
   delete(key: string): Promise<void>;
 }
@@ -23,8 +25,8 @@ export function documentStore(env: Env, backend = "kv"): DocumentStore {
   if (backend !== "kv" || !env.DOCUMENTS_KV)
     throw new HttpError(503, "Private storage is not configured.");
   return {
-    put: (key, bytes) =>
-      env.DOCUMENTS_KV!.put(key, bytes, { expirationTtl: DOCUMENT_TTL }),
+    put: (key, bytes, ttl = DOCUMENT_TTL) =>
+      env.DOCUMENTS_KV!.put(key, bytes, { expirationTtl: ttl }),
     get: (key) => env.DOCUMENTS_KV!.get(key, "arrayBuffer"),
     delete: (key) => env.DOCUMENTS_KV!.delete(key),
   };
@@ -111,20 +113,37 @@ function safeDocx(bytes: Uint8Array): boolean {
     names.has("word/document.xml")
   );
 }
-async function validate(file: File) {
-  if (!file.size || file.size > FILE_LIMIT)
-    throw new HttpError(400, "Use PDF, DOCX or TXT, up to 2 MiB.");
+export async function validateDocumentFile(file: File) {
+  if (!file.size) throw new HttpError(400, "Document is empty.");
+  if (file.size > FILE_LIMIT)
+    throw new HttpError(400, "Document exceeds the 2 MiB per-file limit.");
   const bytes = await file.arrayBuffer(),
     data = new Uint8Array(bytes);
-  const name = safeFilename(file.name).toLowerCase();
-  const pdf =
-    file.type === "application/pdf" &&
-    name.endsWith(".pdf") &&
-    new TextDecoder().decode(data.slice(0, 5)) === "%PDF-" &&
-    new TextDecoder().decode(data.slice(-2048)).includes("%%EOF") &&
-    !/\/(JavaScript|JS|Launch|EmbeddedFile|OpenAction)\b/.test(
-      new TextDecoder().decode(data),
+  // Storage truncation must not remove the extension before validation.
+  const name = file.name.normalize("NFKC").toLowerCase();
+  let pdf = false;
+  if (name.endsWith(".pdf")) {
+    const mime = file.type.split(";", 1)[0].trim().toLowerCase();
+    if (
+      ![
+        "",
+        "application/pdf",
+        "application/x-pdf",
+        "application/octet-stream",
+      ].includes(mime)
+    )
+      throw new HttpError(
+        400,
+        "PDF MIME type conflicts with its extension. Select a PDF reported as application/pdf or a generic binary file.",
+      );
+    await validatePdf(data);
+    pdf = true;
+  } else if (!name.endsWith(".docx") && !name.endsWith(".txt")) {
+    throw new HttpError(
+      400,
+      "Unsupported document extension. Use .pdf, .docx or .txt.",
     );
+  }
   const docx =
     file.type ===
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document" &&
@@ -145,7 +164,9 @@ async function validate(file: File) {
   if (!pdf && !docx && !text)
     throw new HttpError(
       400,
-      "File type, extension or signature is not allowed.",
+      name.endsWith(".docx")
+        ? "DOCX MIME type or ZIP structure is invalid or contains unsupported entries."
+        : "TXT must have MIME type text/plain and contain valid UTF-8 text without binary control characters.",
     );
   return bytes;
 }
@@ -183,21 +204,23 @@ export async function uploadDocument(req: Request, env: Env, user: string) {
   const file = form.get("file") as unknown as File | string | null;
   if (!file || typeof file === "string")
     throw new HttpError(400, "Choose a document.");
-  const bytes = await validate(file),
+  const bytes = await validateDocumentFile(file),
     checksum = await hash(bytes),
     docId = crypto.randomUUID(),
     key = `${user}/${docId}`;
   await consume(env, "kv-write:global", 100);
   await consume(env, `kv-write:${user}`, 10);
   const reserved = await env.DB.prepare(
-    `INSERT INTO documents(id,user_id,name,object_key,content_type,size,storage_backend,storage_state,checksum,expires_at) SELECT ?,?,?,?,?,?,'kv','uploading',?,? WHERE (SELECT COALESCE(SUM(size),0) FROM documents WHERE user_id=? AND storage_state!='deleted')+?<=? AND (SELECT count(*) FROM documents WHERE user_id=? AND storage_state!='deleted')<10 AND (SELECT COALESCE(SUM(size),0) FROM documents WHERE storage_backend='kv' AND (expires_at IS NULL OR expires_at>unixepoch()*1000))+(SELECT COALESCE(SUM(size),0) FROM account_deletion_objects WHERE backend='kv' AND expires_at>unixepoch()*1000)+?<=? RETURNING id`,
+    `INSERT INTO documents(id,user_id,name,object_key,content_type,size,storage_backend,storage_state,checksum,expires_at) SELECT ?,?,?,?,?,?,'kv','uploading',?,? WHERE (SELECT COALESCE(SUM(size),0) FROM documents WHERE user_id=? AND storage_state!='deleted')+?<=? AND (SELECT count(*) FROM documents WHERE user_id=? AND storage_state!='deleted')<10 AND (SELECT COALESCE(SUM(size),0) FROM documents WHERE storage_backend='kv' AND (expires_at IS NULL OR COALESCE(object_expires_at,MAX(expires_at,COALESCE(retained_until,0)))>unixepoch()*1000))+(SELECT COALESCE(SUM(size),0) FROM account_deletion_objects WHERE backend='kv' AND expires_at>unixepoch()*1000)+?<=? RETURNING id`,
   )
     .bind(
       docId,
       user,
       safeFilename(file.name),
       key,
-      file.type,
+      file.name.normalize("NFKC").toLowerCase().endsWith(".pdf")
+        ? "application/pdf"
+        : file.type,
       file.size,
       checksum,
       Date.now() + DOCUMENT_TTL * 1000,
@@ -218,7 +241,7 @@ export async function uploadDocument(req: Request, env: Env, user: string) {
     await store.put(key, bytes);
     // Never reactivate a document concurrently marked for deletion.
     const ready = await env.DB.prepare(
-      `UPDATE documents SET storage_state='ready' WHERE id=? AND storage_state='uploading' RETURNING id`,
+      `UPDATE documents SET storage_state='ready',object_expires_at=expires_at+60000 WHERE id=? AND storage_state='uploading' RETURNING id`,
     )
       .bind(docId)
       .first();
@@ -248,9 +271,9 @@ export async function uploadDocument(req: Request, env: Env, user: string) {
 }
 export async function readyDocument(env: Env, user: string, id: string) {
   const row = await env.DB.prepare(
-    "SELECT * FROM documents WHERE id=? AND user_id=? AND storage_state='ready' AND (expires_at IS NULL OR expires_at>?)",
+    "SELECT * FROM documents WHERE id=? AND user_id=? AND storage_state='ready' AND (expires_at IS NULL OR expires_at>? OR retained_until>?)",
   )
-    .bind(id, user, Date.now())
+    .bind(id, user, Date.now(), Date.now())
     .first<any>();
   if (!row) throw new HttpError(404, "Not found");
   return row;
@@ -298,7 +321,7 @@ export async function deleteDocument(env: Env, user: string, id: string) {
   if (!row) throw new HttpError(404, "Not found");
   // A single conditional UPDATE prevents deleting a file referenced by queued mail.
   const marked = await env.DB.prepare(
-    `UPDATE documents SET storage_state='deleting',purge_after=COALESCE(purge_after,?),cleanup_after=? WHERE id=? AND user_id=? AND NOT EXISTS(SELECT 1 FROM message_attachments a JOIN messages m ON m.id=a.message_id LEFT JOIN automation f ON f.message_id=m.id WHERE a.document_id=? AND (m.status IN ('draft','pending') OR (m.status='sent' AND (f.generated=0 OR EXISTS(SELECT 1 FROM followup_steps step LEFT JOIN transports child ON child.message_id=step.child_id WHERE step.root_id=m.id AND step.cancel_reason IS NULL AND (child.state IS NULL OR child.state!='confirmed')))))) RETURNING id`,
+    `UPDATE documents SET storage_state='deleting',purge_after=COALESCE(purge_after,?),cleanup_after=? WHERE id=? AND user_id=? AND NOT EXISTS(SELECT 1 FROM campaign_attachment_pins WHERE document_id=documents.id) AND NOT EXISTS(SELECT 1 FROM message_attachments a JOIN messages m ON m.id=a.message_id LEFT JOIN automation f ON f.message_id=m.id WHERE a.document_id=? AND (m.status IN ('draft','pending') OR (m.status='sent' AND (f.generated=0 OR EXISTS(SELECT 1 FROM followup_steps step LEFT JOIN transports child ON child.message_id=step.child_id WHERE step.root_id=m.id AND step.cancel_reason IS NULL AND (child.state IS NULL OR child.state!='confirmed')))))) RETURNING id`,
   )
     .bind(Date.now() + 120000, Date.now() + 120000, id, user, id)
     .first();
@@ -316,8 +339,9 @@ export async function deleteDocument(env: Env, user: string, id: string) {
 }
 export async function cleanDocuments(env: Env) {
   const now = Date.now();
+  await maintainAttachmentRetention(env);
   await env.DB.prepare(
-    `UPDATE documents SET storage_state='deleting',purge_after=COALESCE(purge_after,?),cleanup_after=? WHERE id IN (SELECT id FROM documents WHERE (storage_state='uploading' AND created_at<datetime('now','-10 minutes')) OR (storage_state='ready' AND expires_at IS NOT NULL AND expires_at<=?) LIMIT 2)`,
+    `UPDATE documents SET storage_state='deleting',purge_after=COALESCE(purge_after,?),cleanup_after=? WHERE id IN (SELECT id FROM documents WHERE (storage_state='uploading' AND created_at<datetime('now','-10 minutes')) OR (storage_state='ready' AND expires_at IS NOT NULL AND MAX(expires_at,COALESCE(retained_until,0))<=? AND NOT EXISTS(SELECT 1 FROM campaign_attachment_pins WHERE document_id=documents.id)) LIMIT 2)`,
   )
     .bind(now + 120000, now + 120000, now)
     .run();
@@ -342,5 +366,55 @@ export async function cleanDocuments(env: Env) {
         .bind(now + 3600000, row.id)
         .run();
     }
+  }
+}
+
+/** Release completed/cancelled plans and renew one near-expiry private object per tick. */
+export async function maintainAttachmentRetention(env: Env) {
+  await env.DB.prepare(
+    `DELETE FROM campaign_attachment_pins WHERE NOT EXISTS(
+    SELECT 1 FROM messages root WHERE root.id=campaign_attachment_pins.root_id AND
+    (root.status='pending' OR (root.status='sent' AND (
+      EXISTS(SELECT 1 FROM followup_steps f LEFT JOIN messages child ON child.id=f.child_id
+        WHERE f.root_id=root.id AND f.cancel_reason IS NULL AND (child.status IS NULL OR child.status='pending')) OR
+      EXISTS(SELECT 1 FROM automation a WHERE a.message_id=root.id AND a.generated=0 AND a.cancel_reason IS NULL) OR
+      EXISTS(SELECT 1 FROM messages child WHERE child.parent_id=root.id AND child.status='pending')))))`,
+  ).run();
+  await env.DB.prepare(
+    `UPDATE documents SET retained_until=(SELECT MAX(retained_until) FROM campaign_attachment_pins p WHERE p.document_id=documents.id)
+    WHERE retained_until IS NOT (SELECT MAX(retained_until) FROM campaign_attachment_pins p WHERE p.document_id=documents.id)`,
+  ).run();
+  const row = await env.DB.prepare(
+    "SELECT * FROM documents WHERE storage_state='ready' AND retained_until IS NOT NULL AND retained_until<? ORDER BY retained_until LIMIT 1",
+  )
+    .bind(Date.now() + 7 * 86400000)
+    .first<any>();
+  if (!row) return;
+  try {
+    const bytes = await documentBytes(env, row),
+      until = Date.now() + (MAX_SEQUENCE_DAYS + 7) * 86400000;
+    await consume(env, "kv-write:global", 100);
+    await consume(env, `kv-write:${row.user_id}`, 10);
+    await env.DB.prepare(
+      "UPDATE documents SET object_expires_at=MAX(COALESCE(object_expires_at,expires_at,0),?) WHERE id=?",
+    )
+      .bind(until + 60000, row.id)
+      .run();
+    await documentStore(env, row.storage_backend).put(
+      row.object_key,
+      bytes,
+      (MAX_SEQUENCE_DAYS + 7) * 86400,
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE campaign_attachment_pins SET retained_until=MAX(retained_until,?) WHERE document_id=?",
+      ).bind(until, row.id),
+      env.DB.prepare(
+        "UPDATE documents SET retained_until=MAX(COALESCE(retained_until,0),?) WHERE id=?",
+      ).bind(until, row.id),
+    ]);
+  } catch {
+    // Missing or inconsistent required bytes never become an attachment-free send.
+    console.warn("campaign_attachment_retention", "renewal_deferred");
   }
 }

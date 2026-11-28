@@ -1,7 +1,18 @@
-﻿"use client";
+"use client";
+import { MESSAGE_CAPACITY, MESSAGE_CAPACITY_ERROR, checkMessageCapacity } from "../../../shared/message-capacity";
+import { WorkflowProgress } from "./ui";
 import { useRef, useState } from "react";
 import { spreadsheetDraft } from "../../../shared/spreadsheet";
-import type { FollowupStep } from "../../../shared/followup-sequence";
+import {
+  MAX_FOLLOWUPS,
+  delayMilliseconds,
+  type FollowupStep,
+} from "../../../shared/followup-sequence";
+import {
+  EmailAttachments,
+  type AttachmentChoice,
+  type CampaignDocument,
+} from "./email-attachments";
 import type { Api } from "./account-ui";
 type Draft = {
   id: string;
@@ -27,32 +38,66 @@ const followupCount = (draft: Draft) =>
     : 0;
 export function ImportWizard({
   rows,
+  preparedResult,
+  initialName,
   api,
   connections,
+  documents,
   onRefresh,
   onClose,
 }: {
   rows: Record<string, string>[];
+  initialName?: string;
+  preparedResult?: {
+    drafts: Draft[];
+    skipped?: number;
+    reimported?: string[];
+  } | null;
   api: Api;
   connections: Connection[];
+  documents: CampaignDocument[];
   onRefresh: () => Promise<void>;
   onClose: () => void;
 }) {
   const [step, setStep] = useState<
     "prepare" | "choose" | "individual" | "complete" | "success"
-  >("prepare");
-  const [drafts, setDrafts] = useState<Draft[]>([]),
+  >(preparedResult ? "complete" : "prepare");
+  const [drafts, setDrafts] = useState<Draft[]>(() =>
+      (preparedResult?.drafts || []).filter((d) => d.status === "draft"),
+    ),
     [excluded, setExcluded] = useState<string[]>([]),
     [done, setDone] = useState<string[]>([]);
-  const [issues, setIssues] = useState<string[]>([]),
-    [reimported, setReimported] = useState<string[]>([]);
+  const [issues, setIssues] = useState<string[]>(() =>
+      (preparedResult?.drafts || [])
+        .filter((d) => d.status !== "draft")
+        .map(
+          (d) =>
+            `${d.professor_email}: existing ${d.status} message excluded; never replayed.`,
+        ),
+    ),
+    [reimported, setReimported] = useState<string[]>(
+      preparedResult?.reimported || [],
+    );
   const [account, setAccount] = useState(
     connections.find((c) => c.provider === "gmail" && c.status === "connected")
       ?.id || "",
   );
   const [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
-    [name, setName] = useState("Professor outreach campaign");
+    [name, setName] = useState(initialName || "Professor outreach campaign");
+  const [attachmentSelection, setAttachmentSelection] =
+    useState<AttachmentChoice>({ initial: [], followups: {}, recipients: {} });
+  const documentNames = (ids: string[]) =>
+    ids.length
+      ? ids
+          .map(
+            (id) =>
+              documents.find((doc) => doc.id === id)?.name ||
+              "Unavailable document",
+          )
+          .join(", ")
+      : "None";
+  const [reviewStage,setReviewStage] = useState(3);
   const [receipt, setReceipt] = useState<any>(null);
   const [importIds] = useState(() => ({
     manual: crypto.randomUUID(),
@@ -150,6 +195,9 @@ export function ImportWizard({
     } catch {
       /* Storage may be disabled; same-wizard retries still reuse the ID. */
     }
+    const potential = valid.reduce((n,row,i) => { const draft=spreadsheetDraft(row,i,true); return n+1+(draft.followup_proposal?.steps?.length || (draft.followup_proposal ? 1 : 0)); },0);
+    if (potential > MESSAGE_CAPACITY.student) throw Error(MESSAGE_CAPACITY_ERROR);
+    checkMessageCapacity(await api("/capacity?import_id="+encodeURIComponent(importId)),potential);
     const result = await api("/imports/drafts", "POST", {
       import_id: importId,
       rows: valid,
@@ -182,6 +230,7 @@ export function ImportWizard({
   const included = drafts.filter(
     (d) => !excluded.includes(d.id) && !done.includes(d.id),
   );
+  const missingDocuments=included.filter(d=>!(attachmentSelection.recipients[d.id]||attachmentSelection).initial.length);
   const gmail = connections.find((c) => c.id === account);
   async function approve(items: Draft[], complete: boolean) {
     if (!items.length) throw Error("Select at least one recipient.");
@@ -201,6 +250,23 @@ export function ImportWizard({
       ids: items.map((d) => d.id),
       sending_account_id: account,
       authorize_followups: items.some((d) => !!d.followup_proposal),
+      attachment_selection: {
+        ...attachmentSelection,
+        recipients: Object.fromEntries(
+          Object.entries(attachmentSelection.recipients).filter(([id]) =>
+            items.some((d) => d.id === id),
+          ),
+        ),
+      },
+      reviewed_messages: items.map((d) => ({
+        id: d.id,
+        recipient: d.professor_email,
+        subject: d.subject,
+        body: d.body,
+        scheduled_at: d.scheduled_at,
+        timezone: d.timezone,
+        followup_proposal: d.followup_proposal || null,
+      })),
     });
     setDone((prev) => [...prev, ...items.map((d) => d.id)]);
     if (complete) {
@@ -251,6 +317,13 @@ export function ImportWizard({
           timeZone: d.timezone,
         })}{" "}
         ({d.timezone}) · UTC: {d.scheduled_at}
+      </p>
+      <p className="attachment-summary">
+        <strong>Initial attachments:</strong>{" "}
+        {documentNames(
+          attachmentSelection.recipients[d.id]?.initial ||
+            attachmentSelection.initial,
+        )}
       </p>
       {edit ? (
         <>
@@ -307,12 +380,35 @@ export function ImportWizard({
                   {step.delay_value} {step.delay_unit} after {step.relative_to}
                 </summary>
                 <pre className="email-preview">{step.body}</pre>
+                <p className="attachment-summary">
+                  <strong>Attachments for this follow-up:</strong>{" "}
+                  {documentNames(
+                    attachmentSelection.followups[String(index + 1)] || [],
+                  )}
+                </p>
+                <p>
+                  Planned earliest UTC:{" "}
+                  {new Date(
+                    Date.parse(d.scheduled_at) +
+                      (f.steps as FollowupStep[])
+                        .slice(0, index + 1)
+                        .reduce(
+                          (offset, item) =>
+                            item.relative_to === "original"
+                              ? delayMilliseconds(item)
+                              : offset + delayMilliseconds(item),
+                          0,
+                        ),
+                  ).toISOString()}
+                  . This estimate assumes timely confirmed sends; actual send
+                  times determine eligibility.
+                </p>
                 <p>
                   Only if no reply, decline, opt-out or recipient block. A
-                  failed reply check postpones sending. Accelerated multistep
-                  sequences require server-verified controlled recipients. Due
-                  times use actual confirmed sends; cron and Gmail may introduce
-                  delays.
+                  failed reply check postpones sending. Gmail quotas and pacing
+                  can postpone the requested schedule without changing its
+                  delays. Due times use actual confirmed sends; cron and Gmail
+                  may introduce delays.
                 </p>
               </details>
             ));
@@ -322,6 +418,10 @@ export function ImportWizard({
                 Conditional follow-up: {f.subject} · {f.days} days
               </summary>
               <pre className="email-preview">{f.body}</pre>
+              <p className="attachment-summary">
+                <strong>Follow-up attachments:</strong>{" "}
+                {documentNames(attachmentSelection.followups["1"] || [])}
+              </p>
               <p>
                 {f.days} days after confirmed Gmail delivery, only if there is
                 no reply, decline, opt-out or recipient block. Gmail is checked
@@ -367,6 +467,30 @@ export function ImportWizard({
           Close
         </button>
       </div>
+      <WorkflowProgress step={step === "success" ? 5 : step === "prepare" || step === "choose" ? 2 : reviewStage}/>
+      {step !== "success" && (
+        <aside
+          className="campaign-review-guide"
+          aria-label="Campaign review checklist"
+        >
+          <strong>Before you approve</strong>
+          <p>
+            Check professors ? initial emails ? all follow-ups ? CV and
+            attachments ? sender and local / UTC dates. Importing does not send
+            email. One approval authorises the complete displayed plan; approved
+            content and timing cannot be edited.
+          </p>
+          <details>
+            <summary>How attachment selection works</summary>
+            <p>
+              Selecting a CV applies to initial emails by default. Choose
+              attachments separately for each follow-up and check any
+              recipient-specific choices. Expired or unavailable documents must
+              be resolved before approval.
+            </p>
+          </details>
+        </aside>
+      )}
       {error && (
         <p className="feedback error" role="alert">
           {error}
@@ -394,7 +518,9 @@ export function ImportWizard({
         <>
           <p>
             {rows.length} spreadsheet rows uploaded. Choose how to prepare them.
-            Uploading does not authorize sending.
+            Uploading does not authorize sending. Up to {MAX_FOLLOWUPS} optional
+            follow-ups per recipient; only spreadsheet-defined steps are
+            included.
           </p>
           <div className="import-choices">
             <button
@@ -520,7 +646,9 @@ export function ImportWizard({
               ? "Switch to complete campaign review"
               : "Switch to individual review"}
           </button>
-          {drafts.map((d) => preview(d, step === "individual"))}
+          <section className="review-stage" id="campaign-review-stage-3" onFocusCapture={()=>setReviewStage(3)}><h3>3. Review emails</h3><p>Check each professor, message, follow-up rule and scheduled timezone.</p>{drafts.map((d) => preview(d, step === "individual"))}<button type="button" className="secondary" onClick={()=>{setReviewStage(4);document.getElementById('campaign-review-stage-4')?.scrollIntoView({block:'start'});}}>Continue to documents</button></section>
+          <section className="review-stage" id="campaign-review-stage-4" onFocusCapture={()=>setReviewStage(4)}><h3>4. Attach documents</h3><p>Choose your CV and any supported documents. Follow-up attachments are separate choices.</p><EmailAttachments documents={documents} value={attachmentSelection} onChange={setAttachmentSelection} steps={Math.max(0, ...included.map(followupCount))} recipients={included} busy={busy}/><button type="button" className="secondary" onClick={()=>{setReviewStage(5);document.getElementById('campaign-review-stage-5')?.scrollIntoView({block:'start'});}}>Continue to final review</button></section>
+          <section className="review-stage final-review" id="campaign-review-stage-5" onFocusCapture={()=>setReviewStage(5)}><h3>5. Review and approve</h3><p><strong>{name}</strong> / {included.length} initial emails / {included.reduce((count,draft)=>count+followupCount(draft),0)} conditional follow-ups. Review the sender, attachments and all local / UTC dates above before approval.</p>{missingDocuments.length>0&&<div className="feedback error"><strong>No documents attached</strong><p>{missingDocuments.length} of {included.length} initial emails have no attachments.</p><p>{missingDocuments.map(d=>d.professor_name).join(', ')}</p><button type="button" onClick={()=>document.getElementById('campaign-review-stage-4')?.scrollIntoView({block:'start'})}>Attach Documents</button></div>}{!included.length&&<p role="alert">No eligible emails remain. Review the exclusion reasons above, change your selection, or start a new campaign with a fresh import.</p>}</section>
           {step === "complete" && (
             <button
               className="primary full"
@@ -532,7 +660,7 @@ export function ImportWizard({
               }
               onClick={() => run(() => approve(included, true))}
             >
-              APPROVE & SCHEDULE COMPLETE CAMPAIGN
+              Approve Complete Campaign
             </button>
           )}
           <p className="helper">
@@ -559,7 +687,7 @@ export function ImportWizard({
             Latest send: {receipt.latest}
           </p>
           <p>
-            Backend approval and scheduling persisted successfully. No further
+            Your campaign approval and schedule were saved successfully. No further
             approval is required.
           </p>
           <details>
@@ -582,10 +710,7 @@ export function ImportWizard({
             disabled={busy || receipt.cancelled}
             onClick={() =>
               run(async () => {
-                for (const id of receipt.ids) {
-                  await api(`/messages/${id}/automation/cancel`, "POST");
-                  await api(`/messages/${id}/cancel`, "POST");
-                }
+                await api(`/campaigns/${receipt.campaign_id}/cancel`, "POST");
                 await onRefresh();
                 setReceipt({ ...receipt, cancelled: true });
               })

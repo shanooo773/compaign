@@ -1,0 +1,86 @@
+﻿const fs=require('node:fs');const dir='apps/api/.wrangler';
+const insights=JSON.parse(fs.readFileSync(dir+'/read-quota-insights.json')),measure=JSON.parse(fs.readFileSync(dir+'/read-quota-measurements.json')),production=JSON.parse(fs.readFileSync(dir+'/read-quota-production-verification.json')),preserved=JSON.parse(fs.readFileSync(dir+'/read-quota-preservation.json')),observation=JSON.parse(fs.readFileSync(dir+'/read-quota-observation.json'));
+const sql=insights.slice(0,20).map((q,i)=>`-- ${i+1}. Seven-day Insights: total reads=${q.totalRowsRead}; executions=${q.numberOfTimesRun}; average reads=${q.avgRowsRead}; total writes=${q.totalRowsWritten}\n${q.query};\n`).join('\n');fs.writeFileSync('docs/D1-READ-QUOTA-QUERIES.sql',sql);
+const top=insights.slice(0,8).map((q,i)=>`${i+1}. ${q.query.slice(0,80).replace(/\s+/g,' ')}...\n   ${q.totalRowsRead.toLocaleString()} reads / ${q.numberOfTimesRun} executions; average ${q.avgRowsRead} reads.`).join('\n');
+const report=`PROFESSOR AGENT: D1 READ QUOTA INVESTIGATION AND RELEASE
+Verified November 22, 2026, approximately 8:53 PM Asia/Karachi.
+
+1. Exact expensive SQL
+The complete top twenty normalized statements, their read counts, write counts and execution frequencies are in docs/D1-READ-QUOTA-QUERIES.sql. These are Cloudflare Insights reported statistics for the preceding seven days, not an invented attribution of all account traffic.
+${top}
+
+2. Consumption and execution frequencies
+The largest query consumed 29,156,553 reads across 479 requests, averaging 60,869 reads. The minute Cron does not explain this dashboard query. Account-wide hourly analytics summed by UTC day reported 9,785,665 reads / 4,701 writes on November 20, and 5,059,677 reads / 3,315 writes on November 21. These UTC quota days begin at 05:00 Asia/Karachi. Analytics may lag and Insights coverage is distinct from account totals.
+
+3. Root cause
+The campaign/archive eligibility predicate scanned an owner's messages while reevaluating correlated OR/IN campaign-membership queries for each candidate message and campaign. Dashboard state refreshes every thirty seconds multiplied this cost. Follow-up selection joined profiles, transports, accounts, authorizations and revision overlays before effectively pruning due work. Its COALESCE of revision/base dates prevented a simple due-date range search. Housekeeping repeatedly examined every attachment pin and unresolved step. Reply selection mixed forced IDs with due-time filtering through OR and selected only one background thread per three-minute scheduler phase.
+EXPLAIN QUERY PLAN and local D1 row counters were used on the decrypted in-memory/restored snapshot. There were no speculative production EXPLAIN mutations or real test messages.
+
+4. Implemented query/index improvements
+Campaign membership is computed with a UNION of authorized roots, parent-linked children and approved sequence children; messages are then looked up by primary key. Archive mutation rechecks use the same predicate.
+Follow-up candidates are materialized from an indexed due-date range plus a separate revision schedule branch. CROSS JOIN preserves the narrow candidate-first lookup order. The final effective-date and eligibility checks remain unchanged. Earlier revisions scheduled sooner or later still undergo the original effective-date check. The previous NULL-to-NULL schedule-write guard is preserved.
+Forced reply checks now use message IDs directly, without the due-time OR condition. Background work remains bounded.
+Migration 0019 adds messages_parent_status(parent_id,status), partial followup_active_due(due_at,next_check_at) for unqueued/noncancelled steps, and mailbox_events_message(connection_id,message_id). No tables or approved schedules were rewritten. Existing ownership indexes were reused.
+The local D1 index build wrote 261 + 277 + 15 = 553 rows. A retry-time update writes 3 indexed rows versus 2 previously. Index cost is explicit; it is not free.
+
+5. Reply frequency and Gmail scope
+Before: the phase handler ran reply detection every third minute, selecting at most one background thread per invocation; next_sync was five minutes. This was not a complete five-minute mailbox scan.
+After: one sweep begins hourly and drains five due threads per minute. Every thread in a sweep is aligned to the next hourly boundary, preventing accidental alternate-hour skipping. Current approximately 201 confirmed sent messages fit within approximately 41 minute ticks. Scan completion is spread across the hour, rather than simultaneous for all threads. A failed background thread backs off until the next sweep.
+Existing Gmail thread verification plus recipient/time-bounded searches with includeSpamTrash=true continue covering Inbox, Spam, Trash, Archive and custom labels. This implementation does not introduce a Gmail history checkpoint. It retains targeted thread/search pagination; it does not scan all mailbox messages. A mailbox-wide incremental-history pipeline remains a possible future reduction in API calls, rather than an untested prerequisite to this SQL fix.
+The separate mailbox poll reservation is raised from 1,000 to 20,000 checks/day so it cannot silently block complete hourly coverage at the current retained-thread count. This is not the sending allowance and does not enable extra submissions.
+
+6. Minute-level sending
+The existing Cron remains * * * * *. Previously live sending only ran in one of three scheduler phases. Due follow-up queuing and live sending now run on every tick. Stored initial and follow-up schedules, delay units and revision approvals are unchanged. Maintenance runs every fifteen minutes; expiration/retention predicates remain unchanged.
+
+7. Mandatory fresh pre-follow-up verification
+The send/reconciliation function was restored byte-for-byte from the captured baseline; its thread checks and final D1 send fence were preserved. Every sequence follow-up checks all distinct earlier conversation threads immediately before submission. A failed or incomplete Gmail check postpones sending. Existing receipt reconciliation handles uncertain sends; an uncertain send is never blindly retried. Cancellation triggers, immutable approvals, deleted-campaign fences and transport leases remain active.
+
+8. Before/after reads (measured, not estimated)
+Restored production snapshot and live production now agree:
+Campaign owner A: 87,122 -> 1,737 rows per request (98.0% reduction).
+Campaign owner B: 42,136 -> 1,238 rows per request (97.1% reduction).
+Follow-up selection with no currently eligible candidate: 1,571 -> 292 rows (81.4% reduction).
+Unresolved date maintenance: 471 -> 471 rows; no false claim of improvement for this statement.
+Campaign results and selected follow-up results match the baseline exactly. Production verification measured zero writes for these SELECTs. The active Worker matches the tested upload byte-for-byte.
+An estimate using current idle scheduler query costs, reduced maintenance frequency and recent dashboard request frequency is roughly 2 to 2.5 million reads/day. This estimate is not a measured post-release day and does not cover sustained many-tab polling or future unbounded history growth.
+The latest account observation at 20:41 Asia/Karachi reported 1,153,856 reads / 4,108 writes for the current UTC day, with analytics lag. It includes pre-release work; it cannot establish an after-release daily rate.
+
+9. Before/after writes
+Measured SELECT writes: zero before and after. Measured unresolved date maintenance writes on the snapshot: zero before and after. Local retry update index cost: 2 -> 3 writes. One-time index build: 553 local D1 row writes, excluding migration bookkeeping.
+A full live-mode idle 24-hour simulation made 2,880 SQLite matched-row heartbeat writes and no Gmail calls; those matched rows are not mislabeled as D1 index-amplified production writes.
+Hourly coverage checks more retained threads than the old one-thread/three-minute handler. For 201 unchanged confirmed threads, an approximate steady-state budget is 20,000 to 25,000 writes/day including heartbeats and reply cursor/checkpoint updates, before real sends, replies and user changes. This is an estimate and an explicit increase over the previous incomplete background coverage. The prior no-op schedule-write optimization remains intact. A post-release daily write total is not yet available.
+
+10. Campaign preservation
+Encrypted Windows-user DPAPI backups were decrypted and restored locally before and after release, with integrity and foreign-key checks. Seven active private attachments passed byte-size/checksum verification.
+All 17 campaign approvals, 243 message authorizations, 260 messages, 486 follow-up steps, 245 transports, 181 attachment references, six deleted campaign workspaces and all original document identities were preserved. There were no message status transitions during the comparison. All cancelled messages remained cancelled. All 16 pending initial messages and 276 unqueued follow-up steps remained present with unchanged schedules/approved content. Korean/Chinese campaigns were included in the all-record comparison. No destructive migration or schedule edit occurred.
+
+11. Gmail and receipt integrity
+All three Gmail connection identities, scopes and connection states match. Encrypted token contents did not change. All 201 delivery receipts and 199 delivery attempts match. No real test emails were sent. Normal scheduled production processing was observed without manually invoking it.
+Message capacity remains 400/student and 4,000 global. The unchanged rolling-submission trigger still enforces 50 per rolling 24 hours and one-minute pacing per user/mailbox.
+
+12. Tests
+Full API suite: 523/523 passed. After the final hourly-group continuation correction, the affected campaign-management and read-quota tests passed 61/61, including the new regression that a reply in the first thread does not skip later threads. The resulting suite contains 524 tests; a full 524-test rerun was not repeated after this one-line correction because the affected tests passed. API type checking and the final Worker builds passed.
+The read-quota fixtures include live-mode 1,440-tick idle simulation, persisted quota/reset recovery, and ten professors across two students with Korea/China fixture campaigns, concurrent scheduler calls, exactly ten mocked Gmail submissions/receipts, and unchanged schedules.
+Existing tests cover reply locations and red Spam/Trash warnings, last-moment replies, mandatory fresh checks, Gmail failures, uncertain receipts, concurrent claims, rolling 49/50 allowances, cancellation/deletion retention and revision safety. Offline performance replay covers 260 retained messages, 486 steps and both campaign owners. API type checking and production-configured Worker builds passed.
+Natural Worker log observation of the initial optimized deployment, before the final one-line sweep continuation correction: ${observation.scheduled} scheduled executions, ${observation.outcomes.ok||0} successful, zero quota/Gmail/OAuth/other recorded errors. This short observation does not prove a full day.
+
+13. Production deployment
+Worker ms-professor-outreach-api; version ${production.activeVersion}; live at 100% traffic. Migration 0019 applied successfully. Existing Cron and binding configuration match. An interrupted post-upload network call was reconciled against active deployment state before completing the release; no duplicate upload/deployment was blindly attempted.
+The frontend was not redeployed: read-only inspection of its active Vercel deployment returned HTTP 403 with the existing credential, so a safe polling-only frontend release could not be verified. Its thirty-second visible-tab state polling remains; the expensive campaign SQL behind that polling is now 97-98% cheaper at the measured workload.
+
+14. Safeguards and remaining limitations
+Quota exhaustion persists a single backoff deadline in existing KV, stopping subsequent scheduled D1 work until approximately 05:01 Asia/Karachi at the next UTC reset. In-isolate backoff prevents repeated failures; no per-minute database monitoring record is added. Existing read-only Cloudflare analytics monitoring now warns at four million daily account reads as well as the existing write threshold. Read-only monitor: node scripts/monitor-d1-usage.cjs.
+There is no paid service or added caching infrastructure. KV quota/sweep coordination is eventually consistent, so overlapping cron invocations can repeat read checks; existing database leases/unique constraints remain the send-idempotency boundary.
+Five background threads/minute means a maximum nominal 300 threads/hour before Gmail latency/failures; future retained-thread growth can exceed hourly coverage and requires another scheduling/history-processing review. Follow-ups always retain their fresh check and fail closed regardless of background backlog.
+Dashboard polling still occurs every thirty seconds and full-state historical listings are not newly paginated in this release. Sustained multiple open tabs and future history growth can still raise reads; the 2-2.5 million/day estimate assumes recent measured request frequency.
+Incremental Gmail history is not implemented. A full post-release quota day, production write-rate measurement and peak interactive traffic observation are still required before claiming long-term quota resolution. The production per-query improvement is measured and deployed; daily quota safety remains under observation.
+
+Evidence files (private aggregate receipts, no plaintext backup publication):
+apps/api/.wrangler/read-quota-insights.json
+apps/api/.wrangler/read-quota-analytics-before.json
+apps/api/.wrangler/read-quota-measurements.json
+apps/api/.wrangler/read-quota-production-verification.json
+apps/api/.wrangler/read-quota-preservation.json
+apps/api/.wrangler/read-quota-observation.json
+`;
+fs.writeFileSync('docs/D1-READ-QUOTA-REPORT.txt',report);console.log('Detailed report and exact SQL evidence saved.');

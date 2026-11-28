@@ -1,4 +1,6 @@
-# Controlled test recipient recognition — 29 October 2026
+> Historical release record. Current limits, templates, timezone handling and safety behavior are documented in [Excel-driven follow-up upgrade](EXCEL-FOLLOWUP-UPGRADE.md).
+
+# Controlled test recipient recognition ï¿½ 29 October 2026
 
 ## Root cause and configuration
 

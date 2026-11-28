@@ -80,10 +80,11 @@ async function importRows(rows = [row]) {
   return h.db.prepare("SELECT * FROM messages ORDER BY rowid").all() as any[];
 }
 async function approve(ids: string[], followups = false) {
+  const review=await (await h.request("/campaigns/duplicate-check","POST",{ids},owner.session)).json();
   return h.request(
     "/messages/approve",
     "POST",
-    { ids, sending_account_id: connection, authorize_followups: followups },
+    { ids, sending_account_id: connection, without_attachments_acknowledged: true, authorize_followups: followups, duplicate_acknowledgement:review.acknowledgement },
     owner.session,
   );
 }
@@ -311,8 +312,9 @@ describe("real Gmail production workflow", () => {
       ).status,
     ).toBe(200);
     h.db
-      .prepare("DELETE FROM usage_counters WHERE scope LIKE 'send:%:minute'")
+      .prepare("UPDATE delivery_attempts SET started_at=started_at-61000")
       .run();
+    h.db.exec("DELETE FROM usage_counters WHERE scope LIKE 'send:%:minute'");
     const network = send();
     await runLiveJobs(h.env, network as any);
     expect(network).toHaveBeenCalledTimes(1);
@@ -383,8 +385,9 @@ describe("real Gmail production workflow", () => {
     ]);
     await approve(drafts.map((d) => d.id));
     for (let i = 0; i < 2; i++) {
+      h.db.exec("DELETE FROM usage_counters WHERE scope LIKE 'send:%:minute'");
       h.db
-        .prepare("DELETE FROM usage_counters WHERE scope LIKE 'send:%:minute'")
+        .prepare("UPDATE delivery_attempts SET started_at=started_at-61000")
         .run();
       await runLiveJobs(h.env, (async () =>
         Response.json({

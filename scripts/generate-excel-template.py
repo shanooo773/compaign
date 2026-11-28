@@ -4,13 +4,15 @@ from xml.sax.saxutils import escape
 from zipfile import ZipFile, ZIP_DEFLATED, ZipInfo
 import csv
 import json
+import re
 
 root = Path(__file__).resolve().parents[1]
 columns = ["name", "email", "university", "interests", "subject", "body", "scheduled_at", "timezone", "follow_up_days", "follow_up_subject", "follow_up_body"]
 example = ["Synthetic Professor", "controlled@example.com", "Example University", "Robotics and machine learning", "MS research inquiry - sample only", "Dear Professor,\nThis is synthetic sample content. Replace and review before approving.", "2099-01-01T12:00:00Z", "Asia/Karachi", "3", "Follow-up - sample only", "Dear Professor,\nFollowing up on my research inquiry. Thank you for your time."]
 columns += ["follow_up_sequence", "follow_up_delay_value", "follow_up_delay_unit", "follow_up_relative_to"]
 example += ["", "", "", ""]
-for step in range(1, 6):
+maximum = int(re.search(r"MAX_FOLLOWUPS = (\d+)", (root / "shared/followup-sequence.ts").read_text()).group(1))
+for step in range(1, maximum + 1):
     columns += [f"follow_up_{step}_{field}" for field in ["subject", "body", "delay_value", "delay_unit", "relative_to"]]
     example += [""] * 5
 notes = [
@@ -18,24 +20,24 @@ notes = [
     ["All example data is synthetic. No real professor is included."],
     ["Import in Professors. Email columns automatically prepare unapproved drafts for Gmail review."],
     ["Professor-only imports allow 500 rows; complete draft imports allow 25 rows and 5 MB."],
-    ["scheduled_at must be UTC ISO TEXT, for example 2099-01-01T12:00:00Z. Do not use an Excel date cell."],
-    ["timezone is an IANA display timezone (default Asia/Karachi); it does not change the UTC timestamp."],
+    ["scheduled_at accepts UTC ISO text (2099-01-01T12:00:00Z) or Excel date cells. Date cells require an explicit IANA timezone; Asia/Karachi means Pakistan wall time and Asia/Seoul means Korea wall time."],
+    ["UTC ISO text is absolute and never shifted by timezone. Excel date cells and numeric serial dates are interpreted as wall time in the explicit timezone and converted to UTC; missing/ambiguous zones are rejected."],
     ["interests contains professor research details. Subject/body support multiline text."],
-    ["follow_up_days is an integer 1-30 elapsed days after actual Gmail acceptance. Legacy followup_days is also supported."],
+    ["follow_up_days is an integer 1-60 elapsed days after actual Gmail acceptance. Legacy followup_days is also supported."],
     ["Provide follow_up_days, follow_up_subject and follow_up_body together. Legacy followup_* columns remain supported; conflicting aliases are rejected."],
     ["Missing follow-up content is marked in review and cannot be authorized. Spreadsheet authorization columns are ignored."],
     ["Select all campaign drafts, review exact initial and follow-up content, select Gmail, then choose Approve initial emails and automatic follow-ups."],
-    ["One campaign approval authorizes all displayed initial emails and exact conditional steps. Verified controlled tests support up to five follow-ups per recipient; external outreach allows one conservative follow-up. No later approval is required."],
+    ["One campaign approval authorizes all displayed initial emails and exact conditional steps. All enabled recipients support up to ten exact spreadsheet-defined follow-ups. No missing follow-ups are added. No later approval is required."],
     ["Existing owner-controlled sending restrictions still apply. This template never activates sending or changes approved recipients."],
     ["Replies, declines, opt-outs and bounces stop tracked pending follow-ups. Reply access is required."],
     ["Every new upload creates a new campaign, even for previously contacted recipients or identical content and schedules. Retries within that upload reuse its drafts. Genuine opt-outs and account blocks remain enforced."],
 ]
 notes += [
-    ["Controlled example JSON (clear legacy follow-up fields first): " + json.dumps([{"subject": "MS research inquiry - sample only", "body": f"Controlled test follow-up {index + 1}", "delay_value": delay, "delay_unit": "minutes", "relative_to": "previous"} for index, delay in enumerate([5, 10, 15, 30, 30])])],
+    ["Example JSON (clear legacy follow-up fields first): " + json.dumps([{"subject": "MS research inquiry - sample only", "body": f"Controlled test follow-up {index + 1}", "delay_value": delay, "delay_unit": "minutes", "relative_to": "previous"} for index, delay in enumerate([5, 10, 15, 30, 30])])],
     ["Flexible scheduling: clear follow_up_days and use follow_up_delay_value, follow_up_delay_unit (minutes/hours/days), follow_up_relative_to (original/previous), with follow_up_subject/body."],
-    ["For 1-5 steps use numbered follow_up_1_subject/body/delay_value/delay_unit/relative_to through follow_up_5_*, OR a JSON array in follow_up_sequence. Do not mix timing formats."],
+    ["For 1-10 steps use numbered follow_up_1_subject/body/delay_value/delay_unit/relative_to through follow_up_10_*, OR a JSON array in follow_up_sequence. Do not mix timing formats."],
     ["Every due time is anchored to actual confirmed sends in UTC. Previous means the previous successfully confirmed follow-up. Steps execute in order; delays are earliest eligible times, not exact delivery promises."],
-    ["Five-step accelerated tests require a server-verified account-controlled test recipient. Excel cannot verify or authorize a recipient. External outreach permits one follow-up after at least 3 days."],
+    ["Positive integer delays in minutes, hours or days are preserved exactly. Steps must be consecutive, increase in requested time, and finish within 60 days. Existing Gmail pacing and quotas can postpone delivery; no provider limits are bypassed."],
     ["Approval includes every displayed step and the maximum total message count. Replies, declines, opt-outs, cancellation and failed checks stop or postpone sends. Changes require a new campaign approval."],
 ]
 

@@ -65,7 +65,7 @@ const { Miniflare, convertV4MiniflareOptions } = require(
           Date.now() + 600000,
         ),
     ]);
-    const steps = Array.from({ length: 4 }, (_, i) => ({
+    const steps = Array.from({ length: 10 }, (_, i) => ({
       subject: "Conditional " + i,
       body: "Synthetic follow-up " + i,
       delay_value: 5,
@@ -102,7 +102,7 @@ const { Miniflare, convertV4MiniflareOptions } = require(
     assert.equal(r.status, 200, JSON.stringify(r));
     assert.equal(r.body.created, 2);
     for (const d of r.body.drafts)
-      assert.equal(JSON.parse(d.followup_proposal).steps.length, 4);
+      assert.equal(JSON.parse(d.followup_proposal).steps.length, 10);
     const connection = crypto.randomUUID();
     await db.batch([
       db
@@ -140,8 +140,8 @@ const { Miniflare, convertV4MiniflareOptions } = require(
     const preview = await approval.json();
     assert.equal(preview.dry_run, true);
     assert.equal(preview.would_schedule, 1);
-    assert.equal(preview.would_authorize_followups, 4);
-    assert.equal(preview.total_messages, 5);
+    assert.equal(preview.would_authorize_followups, 10);
+    assert.equal(preview.total_messages, 11);
     assert.equal(preview.recipients[0].controlled_test, true);
     assert(
       preview.recipients[0].followup_steps.every(
@@ -214,7 +214,7 @@ const { Miniflare, convertV4MiniflareOptions } = require(
         0,
       );
     console.log(
-      "PASS native Workers/D1: two recipients, four conditional follow-ups each, concurrent retries, changed-payload rejection, forced failure rollback, controlled Gmail dry-run approval of one initial plus four five-minute steps, zero approvals and deliveries. All outbound network forbidden.",
+      "PASS native Workers/D1: two recipients, ten conditional follow-ups each, concurrent retries, changed-payload rejection, forced failure rollback, controlled Gmail dry-run approval of one initial plus ten five-minute steps, zero approvals and deliveries. All outbound network forbidden.",
     );
   } finally {
     await mf.dispose();
