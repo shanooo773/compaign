@@ -1,12 +1,12 @@
 {
-  "name": "ms-professor-outreach-api",
+  "name": "ms-professor-outreach-api-vercel-six",
   "main": "src/index.ts",
   "workers_dev": true,
   "preview_urls": false,
   "compatibility_date": "2026-10-01",
   "vars": {
-    "APP_ORIGIN": "https://ms-professor-agent-malang43.vercel.app",
-    "OAUTH_ENABLED": "true",
+    "APP_ORIGIN": "https://ms-professor-agent-six.vercel.app",
+    "OAUTH_ENABLED": "false",
     "LIVE_EMAIL_ENABLED": "false",
     "MOCK_DELIVERY_ENABLED": "false",
     "AI_PROVIDER": "mock",
@@ -18,13 +18,13 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "outreach",
-      "database_id": "684cb48c-3f43-4cef-8217-cf9624d23522",
+      "database_name": "outreach-vercel-six",
+      "database_id": "a730de41-a1a8-4cb9-956b-b04176c8724e",
       "migrations_dir": "migrations",
     },
   ],
   "kv_namespaces": [
-    { "binding": "DOCUMENTS_KV", "id": "522d30d6935741b0b659d92b3136ec8c" },
+    { "binding": "DOCUMENTS_KV", "id": "707c3086b8ec41b6bc90a9d5da6c7ecf" },
   ],
   "triggers": { "crons": ["* * * * *"] },
   "observability": {

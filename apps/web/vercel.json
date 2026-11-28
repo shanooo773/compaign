@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://ms-professor-outreach-api.aliraza57616.workers.dev/api/:path*"
+      "destination": "https://ms-professor-outreach-api-vercel-six.outreach-api.workers.dev/api/:path*"
     }
   ],
   "headers": [
